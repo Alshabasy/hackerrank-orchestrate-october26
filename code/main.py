@@ -97,7 +97,25 @@ def main() -> None:
         _write_draft_output(dataset, Path(args.draft_output))
         return
 
-    _print_counts(dataset)
+    output_path = ROOT / 'output.csv'
+    rows = []
+    for case in sorted(dataset.deletion_requests, key=lambda row: row.case_id):
+        decision = decide_status(case, dataset)
+        steps = build_steps(case, decision, dataset)
+        rows.append({
+            'case_id': case.case_id,
+            'deletion_status': decision['status'],
+            'steps_json': serialize_steps(steps),
+        })
+    write_output(rows, output_path)
+    try:
+        validate_output_csv(output_path, len(rows), dataset)
+    except Exception as exc:  # pragma: no cover - runtime guard
+        output_path.unlink(missing_ok=True)
+        raise SystemExit(f'Output validation failed: {exc}') from exc
+    print(f'OUTPUT {output_path}')
+    print(f'ROWS {len(rows)}')
+    print(f'STATUS_COUNTS {json.dumps({status: sum(1 for row in rows if row["deletion_status"] == status) for status in sorted({row["deletion_status"] for row in rows})}, sort_keys=True)}')
 
 
 if __name__ == '__main__':

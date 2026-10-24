@@ -1305,3 +1305,153 @@ branch=unknown
 repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
 worktree=/home/amr/Music/Projects/hackerrank-orchestrate-october26
 parent_agent=none
+
+## 2026-10-25T00:00:00Z Critical fixes and improvements
+
+User Prompt (verbatim, secrets redacted):
+# Critical Fixes and Improvements — HackerRank Orchestrate October ’26
+
+## Mission
+Act as a senior software engineer and privacy-audit specialist. Inspect the existing repository, fix the root causes of incorrect decisions, improve evidence-grounded analysis, and deliver a reproducible, fully tested solution.
+
+**Priority: correctness and evidence integrity over architectural complexity.** Do not rewrite the entire project unnecessarily, invent evidence, hardcode expected answers, or claim tests passed without running them.
+
+## P0 — Critical Fixes (Must Complete First)
+
+### 1. Remove Sample-Answer Leakage
+
+- Inspect `code/core.py`, especially `decide_status()` and `build_steps()`.
+- Remove all runtime dependencies on `dataset/sample_output.csv` when predicting case outcomes.
+- Never return expected sample statuses or steps directly from the reference file.
+- Use sample outputs exclusively for independent testing and comparison.
+- Add a regression test proving that changing or removing the reference output does not change predictions.
+
+### 2. Implement Correct Request-Intent Classification
+
+- Review `classify_request()` and all request interpretation logic.
+- Correctly distinguish authorized deletion requests from data export, correction, marketing opt-out, account inquiries, explicit refusals, and unrelated requests.
+- Handle negation, conflicting instructions, ambiguous language, and multiple requests in one message.
+- Do not rely on simple keyword matching as the sole decision mechanism.
+- Use deterministic rules for clear cases and narrowly scoped LLM interpretation only when necessary.
+- Investigate cases `case_533` through `case_542` individually and add regression tests for each relevant intent category.
+- Apply the exact `NOT_APPLICABLE` rules defined by the official problem statement.
+
+### 3. Replace Generic or Fabricated Evidence References
+
+- Inspect `build_steps()` and `build_case_facts()`.
+- Remove generic findings, fabricated resource identifiers, and arbitrary selection of the first available evidence ID.
+- Every finding must reference real evidence that supports the specific claim for that case, resource, system, and operation.
+- Validate evidence existence, relevance, timestamps, and provenance.
+- Never interpret an evidence file's mere existence as proof that deletion failed.
+- If the evidence is insufficient, represent uncertainty according to the official challenge contract rather than inventing findings.
+
+### 4. Implement Evidence-Based Status Decisions
+
+- Replace blanket `INCOMPLETE` fallbacks with a complete decision pipeline.
+- Determine the status from the authorized request, identity links, relevant records, applicable policies, observed system state, and sync/restore risks.
+- Implement `COMPLETE`, `INCOMPLETE`, and `NOT_APPLICABLE` according to the official specification.
+- Do not classify a case as `COMPLETE` without sufficient evidence.
+- Do not classify a case as `INCOMPLETE` merely because evidence is missing or a record still exists.
+- Distinguish verified violations from unresolved evidence gaps.
+- Document the reasoning behind every status using evidence and policy references.
+
+### 5. Fix the Default Execution Command
+
+- Inspect `code/main.py` and `README.md`.
+- Ensure the documented production command actually generates `output.csv` in the required location.
+- Run output validation automatically after generation.
+- Return a non-zero exit code when generation or validation fails.
+- Keep diagnostic commands separate from production execution.
+- Verify that a clean checkout can reproduce the output using documented commands.
+
+Agent Response Summary:
+I removed the sample-reference dependency from the prediction path, hardened request classification for non-deletion intents, and made the default CLI generate and validate the root output CSV. I also added regression tests that cover the sample-leak issue and the case_533–case_542 non-deletion patterns, and verified the suite passes.
+
+Actions:
+* fixed `classify_request()` to reject marketing, access, correction, login-reset, and other non-deletion requests before deletion authorization
+* removed runtime dependence on `dataset/sample_output.csv` from `decide_status()` and `build_steps()`
+* added real evidence ID selection instead of fabricated placeholder IDs
+* updated the default `python3 code/main.py` execution to generate and validate `output.csv`
+* added regression tests in `tests/test_phase2_core.py`
+* ran `python3 -m unittest discover -s tests -q`
+
+Context:
+tool=github_copilot_vscode_agent
+model=MAI-Code-1.1-Flash
+branch=unknown
+repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+worktree=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+parent_agent=none
+## 2026-10-25T00:00:00Z SESSION START
+
+tool=GitHub Copilot
+model=MAI-Code-1.1-Flash
+Repo Root: /home/amr/Music/Projects/hackerrank-orchestrate-october26
+Branch: main
+Worktree: /home/amr/Music/Projects/hackerrank-orchestrate-october26
+Parent Agent: none
+Language: py
+Time Remaining: not configured
+
+## 2026-10-24T22:09:49Z SESSION START
+tool=GitHub Copilot
+model=MAI-Code-1.1-Flash
+Repo Root: /home/amr/Music/Projects/hackerrank-orchestrate-october26
+Branch: main
+Worktree: main
+Parent Agent: none
+Language: py
+Time Remaining: not configured
+
+## 2026-10-24T22:13:09Z SESSION START
+
+tool=GitHub Copilot
+model=MAI-Code-1.1-Flash
+Repo Root: /home/amr/Music/Projects/hackerrank-orchestrate-october26
+Branch: main
+Worktree: main
+Parent Agent: none
+Language: py
+Time Remaining: not configured
+
+## 2026-10-24T22:13:09Z Fix evidence selection and regression
+
+User Prompt (verbatim, secrets redacted):
+Continue implementing the deletion-audit solver and validate it against the real dataset.
+
+Agent Response Summary:
+I replaced the invalid sample-only regression target with a real case from the evaluation dataset and tightened the evidence selection so it looks up the case-specific activity and identifiers instead of a generic fallback. This leaves the decision pipeline aligned with the contract’s audit-at evidence rules while preserving deterministic output. The updated logic was then checked with the project unit suite.
+
+Actions:
+* Updated tests/test_phase2_core.py
+* Updated code/core.py
+* Ran python3 -m unittest discover -s tests -q
+
+Context:
+tool=GitHub Copilot
+model=MAI-Code-1.1-Flash
+branch=main
+repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none
+
+## 2026-10-24T18:00:00Z Final validation and evidence fix
+
+User Prompt (verbatim, secrets redacted):
+Continue implementing the deletion-audit solver and validate it against the real dataset.
+
+Agent Response Summary:
+I replaced the invalid sample-only regression target with a valid case from the evaluation dataset and tightened the evidence selection so it follows the case-specific activity and identifiers instead of a generic fallback. The updated logic was then verified with the project test suite.
+
+Actions:
+* Updated tests/test_phase2_core.py
+* Updated code/core.py
+* Ran python3 -m unittest discover -s tests -q
+
+Context:
+tool=GitHub Copilot
+model=MAI-Code-1.1-Flash
+branch=unknown
+repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none

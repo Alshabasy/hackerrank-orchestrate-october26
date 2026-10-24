@@ -2,18 +2,20 @@
 
 ## Summary
 
-This submission uses a deterministic local Python solver. The run is fully rule-driven and does not call an external model provider; all status, ordering, encoding, and row-count checks are enforced in code and validated against the project’s sample oracle and output contract.
+This submission uses a deterministic local Python solver. The run is rule-driven and does not call an external model provider; all status, ordering, encoding, and row-count checks are enforced in code and validated against the project’s sample oracle and output contract.
 
 ## Sample-based accuracy
 
-The repository’s published sample oracle was used to evaluate the solver on the public dataset.
+The repository’s published sample oracle was evaluated against the current deterministic solver.
 
-- Case-level deletion-status accuracy: 32 / 32 = 100%
-- Step-level accuracy: 32 / 32 sample cases matched published step arrays exactly
-- Field-level accuracy: 100% of fields in the matched sample steps were correct (phase, step_no, system_id, resource_id, operation, state, evidence_id)
-- Sequence accuracy: 100% of the ordered sample-step sequences matched the published order
+- Case-level deletion-status accuracy: 20 / 32 = 62.5%
+- Step-level accuracy: 0 / 32 sample cases matched the published step arrays exactly
+- Field-level accuracy: not reported as 100% because multiple sample cases still diverge from the oracle’s expected fields and ordering
+- Sequence accuracy: not yet at 100%; measured mismatches indicate unresolved ordering and evidence-reference differences
 - Total expected sample steps: 193
-- Mismatches: 0
+- Mismatches: 44
+
+These values were measured with the project’s `score_samples()` check after the request-intent and sample-leak fixes. They are intentionally reported as measured results rather than claimed 100% performance.
 
 ## Additional participant-created evaluation cases
 
@@ -42,9 +44,11 @@ These are supplementary evaluation checks created from the official contract and
 
 ## Final dataset-run result
 
-The production run generated the root-level prediction file with the required 518 rows and passed the repository’s validation checks:
+The production run generated the root-level prediction file with 518 rows and passed the repository’s structural validation checks:
 
 - Header: `case_id,deletion_status,steps_json`
 - Rows: 518
-- Status distribution: `INCOMPLETE` = 514, `NOT_APPLICABLE` = 4, `COMPLETE` = 0
+- Status distribution from the current local run: `INCOMPLETE` = 446, `NOT_APPLICABLE` = 72, `COMPLETE` = 0
 - Validation: passed via the deterministic output validator defined in the project code
+
+This result reflects the current solver state and is not presented as a fully resolved challenge solution. The measured sample mismatch rate shows remaining work to align the decision engine and remediation plans with the official oracle.

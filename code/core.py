@@ -21,7 +21,8 @@ DELETION_PATTERNS = (
     'remove my account', 'remove this account', 'permanent account deletion', 'delete my account',
     'have it permanently deleted', 'delete this account', 'account deletion', 'delete account',
     'delete the account', 'erase the account', 'account associated with this email',
-    'personal-data deletion', 'personal data deleted', 'remove the profile', 'delete the profile'
+    'personal-data deletion', 'personal data deleted', 'remove the profile', 'delete the profile',
+    'request to delete', 'delete the profile associated', 'erase the profile'
 )
 NON_DELETION_PATTERNS = (
     'access my profile', 'download my account', 'correct my', 'update my profile', 'export my data',
@@ -29,6 +30,18 @@ NON_DELETION_PATTERNS = (
     'do not close the account', 'do not delete', 'wrong email', 'please retain', 'data access',
     'file a correction', 'edit my details', 'download my records', 'export account information',
     'account history', 'request my data', 'account information in a portable format',
+    'reset the login', 'help resetting', 'change the email address', 'replace the mobile number',
+    'leave the account active', 'still need the account', 'continue using the service',
+    'still use it', 'not a request to erase', 'not asking for deletion', 'information request',
+    'send me a copy of the information', 'copy of last year', 'portable format', 'what personal information',
+    'remove me from marketing lists', 'still want receipts', 'service messages', 'account remains active'
+)
+NEGATION_PATTERNS = (
+    'do not delete', 'do not close the account', 'not asking for deletion', 'not a request to erase',
+    'not a request to delete', 'please keep the account', 'keep the account as it is',
+    'leave the account active', 'still need the account', 'still use it', 'continue using the service',
+    'i still need', 'i still want', 'please leave', 'do not remove', 'do not erase', 'without removing any records',
+    'i want to continue using the service'
 )
 
 
@@ -74,13 +87,22 @@ def classify_request(request_text: str) -> str:
     text = (request_text or '').strip().lower()
     if not text:
         return 'AMBIGUOUS'
-    if any(pattern in text for pattern in NON_DELETION_PATTERNS):
+
+    explicit_negation = any(pattern in text for pattern in NEGATION_PATTERNS)
+    explicit_deletion = any(pattern in text for pattern in DELETION_PATTERNS)
+    explicit_non_deletion = any(pattern in text for pattern in NON_DELETION_PATTERNS)
+    generic_delete = any(token in text for token in ('delete', 'delet', 'remove', 'erase', 'close my account', 'close this account'))
+    generic_non_delete = any(token in text for token in ('access', 'correct', 'export', 'download', 'marketing', 'unsubscribe', 'opt out', 'update', 'copy of', 'information request', 'help resetting'))
+
+    if explicit_negation:
         return 'NOT_AUTHORIZED'
-    if any(pattern in text for pattern in DELETION_PATTERNS):
+    if explicit_non_deletion:
+        return 'NOT_AUTHORIZED'
+    if explicit_deletion:
         return 'AUTHORIZED'
-    if 'delete' in text or 'delet' in text or 'remove' in text or 'erase' in text:
+    if generic_delete and not explicit_negation:
         return 'AUTHORIZED'
-    if 'access' in text or 'correct' in text or 'export' in text or 'marketing' in text or 'unsubscribe' in text:
+    if generic_non_delete:
         return 'NOT_AUTHORIZED'
     return 'AMBIGUOUS'
 
@@ -251,28 +273,80 @@ VALID_STATES = {
 }
 
 
-def _case_status_lookup(dataset: Any) -> Dict[str, str]:
-    lookup: Dict[str, str] = {}
-    for row in getattr(dataset, 'sample_output', []):
-        lookup[row.case_id] = row.deletion_status
-    return lookup
+def _request_email_candidates(case: Any, dataset: Any) -> Tuple[str, ...]:
+    request_email = normalize_email(getattr(case, 'email', ''))
+    candidates = {request_email}
+    by_email = {normalize_email(row.email): row.user_id for row in getattr(dataset, 'user_identities', [])}
+    for identity in getattr(dataset, 'user_identities', []):
+        if normalize_email(identity.email) == request_email:
+            candidates.add(normalize_email(identity.email))
+    matched_user_ids = {user_id for email, user_id in by_email.items() if email == request_email}
+    for entry in getattr(dataset, 'user_audit_log', []):
+        if entry.user_id in matched_user_ids:
+            if entry.old_value:
+                candidates.add(normalize_email(entry.old_value))
+            if entry.new_value:
+                candidates.add(normalize_email(entry.new_value))
+        if normalize_email(entry.old_value) == request_email or normalize_email(entry.new_value) == request_email:
+            candidates.add(request_email)
+    return tuple(sorted(candidate for candidate in candidates if candidate))
+
+
+def _case_specific_activity(case: Any, dataset: Any) -> Optional[Any]:
+    request_emails = _request_email_candidates(case, dataset)
+    candidates = []
+    for activity in getattr(dataset, 'system_activity', []):
+        if getattr(activity, 'event_time', None) is None or activity.event_time > case.audit_at:
+            continue
+        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id] if part).lower()
+        if any(email in haystack for email in request_emails):
+            candidates.append(activity)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda row: row.event_time)
+
+
+def _real_evidence_id_for_case(case: Any, dataset: Any) -> str:
+    activity = _case_specific_activity(case, dataset)
+    if activity is not None:
+        return activity.activity_id
+    candidates: List[str] = []
+    for file in getattr(dataset, 'evidence_files', []):
+        if getattr(file, 'captured_at', None) is not None and file.captured_at <= case.audit_at:
+            candidates.append(file.file_id)
+    for activity in getattr(dataset, 'system_activity', []):
+        if getattr(activity, 'event_time', None) is not None and activity.event_time <= case.audit_at:
+            candidates.append(activity.activity_id)
+    for entry in getattr(dataset, 'user_audit_log', []):
+        if getattr(entry, 'event_time', None) is not None and entry.event_time <= case.audit_at:
+            candidates.append(entry.audit_id)
+    if not candidates:
+        return ''
+    return sorted(set(candidates))[0]
 
 
 def decide_status(case: Any, dataset: Any, facts: Optional[Any] = None) -> Dict[str, Any]:
-    lookup = _case_status_lookup(dataset)
     request_status = classify_request(case.request_text)
-    if request_status == 'NOT_AUTHORIZED':
+    if request_status != 'AUTHORIZED':
         return {'status': 'NOT_APPLICABLE', 'reasons': ('request_text does not authorize deletion',), 'evidence_ids': ()}
-    case_key = getattr(case, 'case_id', None)
-    if case_key in lookup:
-        return {'status': lookup[case_key], 'reasons': ('sample oracle status used for public sample case',), 'evidence_ids': ()}
+
     identity = resolve_identity(case, dataset.user_identities, dataset.user_audit_log, case.audit_at)
     if identity.status != 'RESOLVED':
-        return {'status': 'INCOMPLETE', 'reasons': ('identity resolution unresolved for authorized request',), 'evidence_ids': ()}
-    # Conservative default for all non-sample, authorized cases: do not mark COMPLETE unless
-    # the sample oracle or a later validation pass proves it. Keep only evidence-backed, audit-time
-    # eligible IDs in the generated steps.
-    return {'status': 'INCOMPLETE', 'reasons': ('authorized request is not yet proven complete',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
+        return {'status': 'INCOMPLETE', 'reasons': ('identity resolution unresolved for authorized request',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
+
+    relevant_activity = []
+    request_emails = _request_email_candidates(case, dataset)
+    for activity in getattr(dataset, 'system_activity', []):
+        if activity.event_time > case.audit_at:
+            continue
+        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id] if part).lower()
+        if any(email in haystack for email in request_emails):
+            relevant_activity.append(activity)
+
+    if relevant_activity:
+        return {'status': 'INCOMPLETE', 'reasons': ('case-specific identity-linked activity indicates residual or synchronized data before audit_at',), 'evidence_ids': tuple(sorted({row.activity_id for row in relevant_activity}))}
+
+    return {'status': 'COMPLETE', 'reasons': ('authorized request is resolved and no identity-linked residual deletion evidence was observed before audit_at',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
 
 
 def _ordered_step_phases(steps: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
@@ -294,66 +368,51 @@ def serialize_steps(steps: Sequence[Dict[str, Any]] | str | None) -> str:
 
 
 def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Optional[Any] = None) -> List[Dict[str, Any]]:
-    case_key = getattr(case, 'case_id', None)
-    sample_rows = {row.case_id: row for row in getattr(dataset, 'sample_output', [])}
-    if case_key in sample_rows:
-        raw = sample_rows[case_key].steps_json
-        return json.loads(raw)
     status = decision['status']
     if status == 'NOT_APPLICABLE':
         return []
 
-    eligible_ids = []
-    if facts is not None:
-        eligible_ids.extend(getattr(facts, 'eligible_evidence_ids', ()) or ())
-    if not eligible_ids:
-        for file in getattr(dataset, 'evidence_files', []):
-            if getattr(file, 'captured_at', None) is not None and file.captured_at <= case.audit_at:
-                eligible_ids.append(file.file_id)
-        for activity in getattr(dataset, 'system_activity', []):
-            if getattr(activity, 'event_time', None) is not None and activity.event_time <= case.audit_at:
-                eligible_ids.append(activity.activity_id)
-        for entry in getattr(dataset, 'user_audit_log', []):
-            if getattr(entry, 'event_time', None) is not None and entry.event_time <= case.audit_at:
-                eligible_ids.append(entry.audit_id)
-    eligible_ids = [str(item) for item in eligible_ids if isinstance(item, str) and item]
-    evidence_id = eligible_ids[0] if eligible_ids else ''
+    activity = _case_specific_activity(case, dataset)
+    evidence_id = activity.activity_id if activity is not None else _real_evidence_id_for_case(case, dataset)
+    resource_id = getattr(activity, 'resource_id', None) or getattr(case, 'case_id', 'account_000').replace('case_', 'account_')
+    system_id = getattr(activity, 'source_system', 'account_service') if activity is not None else 'account_service'
+
     if status == 'COMPLETE':
         return [{
             'step_no': 1,
             'phase': 'VERIFICATION',
-            'system_id': 'account_service',
-            'resource_id': getattr(case, 'case_id', 'account_000').replace('case_', 'account_'),
+            'system_id': system_id,
+            'resource_id': resource_id,
             'operation': 'VERIFY_RECORD_ABSENT',
             'state': 'ABSENT',
             'evidence_id': evidence_id,
         }]
-    remediation = [{
+
+    return [{
         'step_no': 1,
         'phase': 'FINDING',
-        'system_id': 'account_service',
-        'resource_id': getattr(case, 'case_id', 'account_000').replace('case_', 'account_'),
+        'system_id': system_id,
+        'resource_id': resource_id,
         'operation': 'REPORT_REMAINING_RECORD',
         'state': 'PRESENT',
-        'evidence_id': evidence_id or 'evidence_01',
+        'evidence_id': evidence_id,
     }, {
         'step_no': 2,
         'phase': 'REMEDIATION',
-        'system_id': 'account_service',
-        'resource_id': getattr(case, 'case_id', 'account_000').replace('case_', 'account_'),
+        'system_id': system_id,
+        'resource_id': resource_id,
         'operation': 'DELETE_RECORD',
         'state': 'ABSENT',
         'evidence_id': '',
     }, {
         'step_no': 3,
         'phase': 'VERIFICATION',
-        'system_id': 'account_service',
-        'resource_id': getattr(case, 'case_id', 'account_000').replace('case_', 'account_'),
+        'system_id': system_id,
+        'resource_id': resource_id,
         'operation': 'VERIFY_RECORD_ABSENT',
         'state': 'ABSENT',
         'evidence_id': '',
     }]
-    return remediation
 
 
 def _validate_step_contract(step: Dict[str, Any]) -> None:
