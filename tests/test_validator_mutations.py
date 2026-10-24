@@ -126,8 +126,8 @@ class ValidatorMutationTests(unittest.TestCase):
         self.assertTrue(any('not found in evidence' in e or 'not found' in e for e in errs))
 
     def test_validator_rejects_post_audit_evidence_id(self):
-        rows = [{'case_id': 'case_33', 'deletion_status': 'COMPLETE', 'steps_json': '[{"step_no":1,"phase":"VERIFICATION","system_id":"account_service","resource_id":"account_001","operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":"evidence_94"}]'}]
-        errs = validate_output_csv(self._write_valid_file(rows), DATASET, ['case_33'])
+        rows = [{'case_id': 'case_01', 'deletion_status': 'COMPLETE', 'steps_json': '[{"step_no":1,"phase":"VERIFICATION","system_id":"account_service","resource_id":"account_001","operation":"VERIFY_RECORD_ABSENT","state":"ABSENT","evidence_id":"evidence_94"}]'}]
+        errs = validate_output_csv(self._write_valid_file(rows), DATASET, ['case_01'])
         self.assertTrue(any('after audit_at' in e for e in errs))
         os.unlink(self._write_valid_file(rows))
 

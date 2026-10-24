@@ -62,10 +62,10 @@ class Phase2CoreTests(unittest.TestCase):
             self.assertEqual(decide_status(case, DATASET)['status'], 'NOT_APPLICABLE')
 
     def test_sample_reference_is_not_used_to_predict_outcomes(self):
-        case = next(row for row in DATASET.deletion_requests if row.case_id == 'case_33')
+        case = next(row for row in DATASET.sample_deletion_requests if row.case_id == 'case_01')
         baseline_dataset = deepcopy(DATASET)
         mutated_dataset = deepcopy(DATASET)
-        object.__setattr__(mutated_dataset, 'sample_output', [SimpleNamespace(case_id='case_33', deletion_status='COMPLETE', steps_json='[]')])
+        object.__setattr__(mutated_dataset, 'sample_output', [SimpleNamespace(case_id='case_01', deletion_status='COMPLETE', steps_json='[]')])
 
         base_decision = decide_status(case, baseline_dataset)
         mutated_decision = decide_status(case, mutated_dataset)
@@ -73,7 +73,7 @@ class Phase2CoreTests(unittest.TestCase):
         self.assertEqual(build_steps(case, mutated_decision, mutated_dataset), build_steps(case, base_decision, baseline_dataset))
 
     def test_live_account_record_uses_case_specific_evidence(self):
-        case = next(row for row in DATASET.deletion_requests if row.case_id == 'case_33')
+        case = next(row for row in DATASET.sample_deletion_requests if row.case_id == 'case_05')
         decision = decide_status(case, DATASET)
         steps = build_steps(case, decision, DATASET)
         self.assertEqual(decision['status'], 'INCOMPLETE')

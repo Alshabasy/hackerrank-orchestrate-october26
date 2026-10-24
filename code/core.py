@@ -292,14 +292,69 @@ def _request_email_candidates(case: Any, dataset: Any) -> Tuple[str, ...]:
     return tuple(sorted(candidate for candidate in candidates if candidate))
 
 
+def _subject_tokens(case: Any, dataset: Any) -> Set[str]:
+    tokens: Set[str] = set()
+    request_email = normalize_email(getattr(case, 'email', ''))
+    if request_email:
+        tokens.add(request_email)
+    matched_user_ids = set()
+    by_email = {normalize_email(row.email): row.user_id for row in getattr(dataset, 'user_identities', [])}
+    if request_email in by_email:
+        matched_user_ids.add(by_email[request_email])
+    for identity in getattr(dataset, 'user_identities', []):
+        if normalize_email(identity.email) == request_email:
+            matched_user_ids.add(identity.user_id)
+            tokens.add(normalize_email(identity.email))
+            tokens.add(normalize_email(identity.name))
+            digits = normalize_phone(identity.phone)
+            if digits:
+                tokens.add(digits)
+    for entry in getattr(dataset, 'user_audit_log', []):
+        if entry.user_id in matched_user_ids or normalize_email(getattr(entry, 'old_value', '')) == request_email or normalize_email(getattr(entry, 'new_value', '')) == request_email:
+            for value in (entry.old_value, entry.new_value):
+                if value:
+                    normalized = normalize_email(value)
+                    if normalized:
+                        tokens.add(normalized)
+                    digits = normalize_phone(value)
+                    if digits:
+                        tokens.add(digits)
+    return {token.lower() for token in tokens if token}
+
+
+def _case_resource_candidates(case: Any, dataset: Any) -> Set[str]:
+    subject_tokens = _subject_tokens(case, dataset)
+    resource_ids: Set[str] = set()
+    for file in getattr(dataset, 'evidence_files', []):
+        if getattr(file, 'captured_at', None) is None or file.captured_at > case.audit_at:
+            continue
+        try:
+            path = Path('dataset') / file.file_path
+            content = path.read_text(encoding='utf-8-sig', errors='replace')
+        except Exception:
+            continue
+        if not any(token in content.lower() for token in subject_tokens if token):
+            continue
+        resource_ids |= {match for match in re.findall(r'(?i)(?:account|user|profile|analytics|search|customer)_[A-Za-z0-9]+', content) if match}
+    return resource_ids
+
+
 def _case_specific_activity(case: Any, dataset: Any) -> Optional[Any]:
     request_emails = _request_email_candidates(case, dataset)
+    subject_tokens = _subject_tokens(case, dataset)
+    resource_ids = _case_resource_candidates(case, dataset)
     candidates = []
     for activity in getattr(dataset, 'system_activity', []):
         if getattr(activity, 'event_time', None) is None or activity.event_time > case.audit_at:
             continue
-        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id] if part).lower()
+        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id, getattr(activity, 'event_type', '')] if part).lower()
         if any(email in haystack for email in request_emails):
+            candidates.append(activity)
+            continue
+        if resource_ids and activity.resource_id in resource_ids:
+            candidates.append(activity)
+            continue
+        if any(token in haystack for token in subject_tokens):
             candidates.append(activity)
     if not candidates:
         return None
@@ -325,6 +380,29 @@ def _real_evidence_id_for_case(case: Any, dataset: Any) -> str:
     return sorted(set(candidates))[0]
 
 
+def _relevant_case_activity(case: Any, dataset: Any) -> List[Any]:
+    request_emails = _request_email_candidates(case, dataset)
+    subject_tokens = _subject_tokens(case, dataset)
+    resource_ids = _case_resource_candidates(case, dataset)
+    relevant: List[Any] = []
+    for activity in getattr(dataset, 'system_activity', []):
+        if getattr(activity, 'event_time', None) is None or activity.event_time > case.audit_at:
+            continue
+        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id, getattr(activity, 'event_type', '')] if part).lower()
+        if any(email in haystack for email in request_emails):
+            relevant.append(activity)
+            continue
+        if activity.resource_id in resource_ids:
+            relevant.append(activity)
+            continue
+        if any(token in haystack for token in subject_tokens):
+            relevant.append(activity)
+            continue
+        if any(token in haystack for token in [token.lower() for token in {case.case_id, normalize_email(case.email)} if token]):
+            relevant.append(activity)
+    return sorted(relevant, key=lambda row: row.event_time)
+
+
 def decide_status(case: Any, dataset: Any, facts: Optional[Any] = None) -> Dict[str, Any]:
     request_status = classify_request(case.request_text)
     if request_status != 'AUTHORIZED':
@@ -334,19 +412,25 @@ def decide_status(case: Any, dataset: Any, facts: Optional[Any] = None) -> Dict[
     if identity.status != 'RESOLVED':
         return {'status': 'INCOMPLETE', 'reasons': ('identity resolution unresolved for authorized request',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
 
-    relevant_activity = []
-    request_emails = _request_email_candidates(case, dataset)
-    for activity in getattr(dataset, 'system_activity', []):
-        if activity.event_time > case.audit_at:
-            continue
-        haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id] if part).lower()
-        if any(email in haystack for email in request_emails):
-            relevant_activity.append(activity)
+    relevant_activity = _relevant_case_activity(case, dataset)
+    residual_records = [activity for activity in relevant_activity if activity.event_type in {'DELETE_RECORD', 'INDEX_RECORD', 'UPDATE_RECORD', 'CREATE_EXPORT', 'CHECK_DATA_FLOW'}]
+    active_flows = [activity for activity in relevant_activity if activity.event_type in {'SYNC_RECORD', 'CHECK_DATA_FLOW'}]
+    restore_risks = [activity for activity in relevant_activity if activity.event_type in {'RESTORE_BACKUP', 'CHECK_RESTORE_ACCESS'}]
 
-    if relevant_activity:
-        return {'status': 'INCOMPLETE', 'reasons': ('case-specific identity-linked activity indicates residual or synchronized data before audit_at',), 'evidence_ids': tuple(sorted({row.activity_id for row in relevant_activity}))}
+    if residual_records or active_flows or restore_risks:
+        return {
+            'status': 'INCOMPLETE',
+            'reasons': (
+                'identity-linked evidence shows remaining records or active recreation paths before audit_at',
+            ),
+            'evidence_ids': tuple(sorted({row.activity_id for row in relevant_activity})),
+        }
 
-    return {'status': 'COMPLETE', 'reasons': ('authorized request is resolved and no identity-linked residual deletion evidence was observed before audit_at',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
+    return {
+        'status': 'COMPLETE',
+        'reasons': ('authorized request is resolved and no identity-linked residual deletion evidence was observed before audit_at',),
+        'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset))),
+    }
 
 
 def _ordered_step_phases(steps: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
@@ -372,10 +456,28 @@ def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Option
     if status == 'NOT_APPLICABLE':
         return []
 
-    activity = _case_specific_activity(case, dataset)
-    evidence_id = activity.activity_id if activity is not None else _real_evidence_id_for_case(case, dataset)
-    resource_id = getattr(activity, 'resource_id', None) or getattr(case, 'case_id', 'account_000').replace('case_', 'account_')
-    system_id = getattr(activity, 'source_system', 'account_service') if activity is not None else 'account_service'
+    relevant = _relevant_case_activity(case, dataset)
+    subject_resources = _case_resource_candidates(case, dataset)
+    matched_evidence = []
+    for file in getattr(dataset, 'evidence_files', []):
+        if getattr(file, 'captured_at', None) is not None and file.captured_at <= case.audit_at:
+            try:
+                content = (Path('dataset') / file.file_path).read_text(encoding='utf-8-sig', errors='replace')
+            except Exception:
+                continue
+            if not any(token in content.lower() for token in _subject_tokens(case, dataset)):
+                continue
+            matched_evidence.append(file.file_id)
+
+    if not relevant:
+        resource_id = getattr(case, 'case_id', 'account_000').replace('case_', 'account_')
+        system_id = 'account_service'
+        evidence_id = _real_evidence_id_for_case(case, dataset)
+    else:
+        anchor = relevant[-1]
+        resource_id = getattr(anchor, 'resource_id', None) or (next(iter(subject_resources)) if subject_resources else getattr(case, 'case_id', 'account_000').replace('case_', 'account_'))
+        system_id = getattr(anchor, 'source_system', 'account_service') or 'account_service'
+        evidence_id = matched_evidence[0] if matched_evidence else anchor.activity_id
 
     if status == 'COMPLETE':
         return [{
@@ -388,31 +490,129 @@ def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Option
             'evidence_id': evidence_id,
         }]
 
-    return [{
-        'step_no': 1,
-        'phase': 'FINDING',
-        'system_id': system_id,
-        'resource_id': resource_id,
-        'operation': 'REPORT_REMAINING_RECORD',
-        'state': 'PRESENT',
-        'evidence_id': evidence_id,
-    }, {
-        'step_no': 2,
-        'phase': 'REMEDIATION',
-        'system_id': system_id,
-        'resource_id': resource_id,
-        'operation': 'DELETE_RECORD',
-        'state': 'ABSENT',
-        'evidence_id': '',
-    }, {
-        'step_no': 3,
+    finding_steps: List[Dict[str, Any]] = []
+    for idx, activity in enumerate(relevant[:3], start=1):
+        if activity.event_type in {'DELETE_RECORD', 'INDEX_RECORD', 'UPDATE_RECORD', 'CREATE_EXPORT'}:
+            finding_steps.append({
+                'step_no': len(finding_steps) + 1,
+                'phase': 'FINDING',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'REPORT_REMAINING_RECORD',
+                'state': 'PRESENT',
+                'evidence_id': activity.activity_id,
+            })
+        elif activity.event_type in {'SYNC_RECORD', 'CHECK_DATA_FLOW'}:
+            finding_steps.append({
+                'step_no': len(finding_steps) + 1,
+                'phase': 'FINDING',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'REPORT_ACTIVE_DATA_FLOW',
+                'state': 'ACTIVE',
+                'evidence_id': activity.activity_id,
+            })
+        elif activity.event_type in {'RESTORE_BACKUP', 'CHECK_RESTORE_ACCESS'}:
+            finding_steps.append({
+                'step_no': len(finding_steps) + 1,
+                'phase': 'FINDING',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'REPORT_RESTORE_RISK',
+                'state': 'ACTIVE',
+                'evidence_id': activity.activity_id,
+            })
+
+    if not finding_steps:
+        finding_steps.append({
+            'step_no': 1,
+            'phase': 'FINDING',
+            'system_id': system_id,
+            'resource_id': resource_id,
+            'operation': 'REPORT_REMAINING_RECORD',
+            'state': 'PRESENT',
+            'evidence_id': evidence_id,
+        })
+
+    remediation_steps: List[Dict[str, Any]] = []
+    for activity in relevant[:3]:
+        if activity.event_type in {'SYNC_RECORD', 'CHECK_DATA_FLOW'}:
+            remediation_steps.append({
+                'step_no': len(remediation_steps) + 1,
+                'phase': 'REMEDIATION',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'DISABLE_DATA_FLOW',
+                'state': 'DISABLED',
+                'evidence_id': '',
+            })
+        elif activity.event_type in {'RESTORE_BACKUP', 'CHECK_RESTORE_ACCESS'}:
+            remediation_steps.append({
+                'step_no': len(remediation_steps) + 1,
+                'phase': 'REMEDIATION',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'BLOCK_RESTORE',
+                'state': 'BLOCKED',
+                'evidence_id': '',
+            })
+        elif activity.event_type in {'DELETE_RECORD', 'INDEX_RECORD', 'UPDATE_RECORD', 'CREATE_EXPORT'}:
+            remediation_steps.append({
+                'step_no': len(remediation_steps) + 1,
+                'phase': 'REMEDIATION',
+                'system_id': activity.source_system,
+                'resource_id': activity.resource_id,
+                'operation': 'DELETE_RECORD',
+                'state': 'ABSENT',
+                'evidence_id': '',
+            })
+
+    if not remediation_steps:
+        remediation_steps.append({
+            'step_no': 1,
+            'phase': 'REMEDIATION',
+            'system_id': system_id,
+            'resource_id': resource_id,
+            'operation': 'DELETE_RECORD',
+            'state': 'ABSENT',
+            'evidence_id': '',
+        })
+
+    verification_steps: List[Dict[str, Any]] = []
+    verification_steps.append({
+        'step_no': len(verification_steps) + 1,
         'phase': 'VERIFICATION',
         'system_id': system_id,
         'resource_id': resource_id,
         'operation': 'VERIFY_RECORD_ABSENT',
         'state': 'ABSENT',
         'evidence_id': '',
-    }]
+    })
+    if any(activity.event_type in {'SYNC_RECORD', 'CHECK_DATA_FLOW'} for activity in relevant):
+        verification_steps.append({
+            'step_no': len(verification_steps) + 1,
+            'phase': 'VERIFICATION',
+            'system_id': system_id,
+            'resource_id': resource_id,
+            'operation': 'VERIFY_DATA_FLOW_DISABLED',
+            'state': 'DISABLED',
+            'evidence_id': '',
+        })
+    if any(activity.event_type in {'RESTORE_BACKUP', 'CHECK_RESTORE_ACCESS'} for activity in relevant):
+        verification_steps.append({
+            'step_no': len(verification_steps) + 1,
+            'phase': 'VERIFICATION',
+            'system_id': system_id,
+            'resource_id': resource_id,
+            'operation': 'VERIFY_RESTORE_BLOCKED',
+            'state': 'BLOCKED',
+            'evidence_id': '',
+        })
+
+    steps = finding_steps + remediation_steps + verification_steps
+    for idx, step in enumerate(steps, start=1):
+        step['step_no'] = idx
+    return steps
 
 
 def _validate_step_contract(step: Dict[str, Any]) -> None:

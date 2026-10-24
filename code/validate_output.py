@@ -93,6 +93,9 @@ def load_dataset(dataset_root: Path | object) -> Dict[str, object]:
             case_rows = {}
             for row in deletion_requests:
                 case_rows[row.case_id] = {'case_id': row.case_id, 'audit_at': row.audit_at}
+            if hasattr(dataset_root, 'sample_deletion_requests'):
+                for row in dataset_root.sample_deletion_requests:
+                    case_rows.setdefault(row.case_id, {'case_id': row.case_id, 'audit_at': row.audit_at})
             evidence_lookup = {r.file_id: r.captured_at for r in evidence_files}
             evidence_lookup.update({r.activity_id: r.event_time for r in system_activity})
             evidence_lookup.update({r.audit_id: r.event_time for r in user_audit_log})
@@ -126,6 +129,15 @@ def load_dataset(dataset_root: Path | object) -> Dict[str, object]:
         row['requested_at'] = parse_iso8601(row['requested_at'])
         row['reported_at'] = parse_iso8601(row['reported_at'])
         cases[row['case_id']] = row
+    sample_cases_path = dataset_root / 'sample_deletion_requests.csv'
+    if sample_cases_path.exists():
+        for row in _read_csv(sample_cases_path):
+            if row['case_id'] not in cases:
+                row = dict(row)
+                row['audit_at'] = parse_iso8601(row['audit_at'])
+                row['requested_at'] = parse_iso8601(row['requested_at'])
+                row['reported_at'] = parse_iso8601(row['reported_at'])
+                cases[row['case_id']] = row
 
     evidence_lookup = {r['file_id']: parse_iso8601(r['captured_at']) for r in evidence_files}
     evidence_lookup.update({r['activity_id']: parse_iso8601(r['event_time']) for r in system_activity})
