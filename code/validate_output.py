@@ -108,6 +108,7 @@ def load_dataset(dataset_root: Path | object) -> Dict[str, object]:
             return {
                 'case_rows': case_rows,
                 'case_ids': sorted(case_rows),
+                'submission_case_ids': sorted(row.case_id for row in deletion_requests),
                 'evidence_lookup': evidence_lookup,
                 'file_ids': {r.file_id for r in evidence_files},
                 'activity_ids': {r.activity_id for r in system_activity},
@@ -153,6 +154,9 @@ def load_dataset(dataset_root: Path | object) -> Dict[str, object]:
     return {
         'case_rows': cases,
         'case_ids': sorted(cases),
+        # Public sample cases belong in the evidence/cutoff lookup, but the
+        # submission CSV must contain only production evaluation requests.
+        'submission_case_ids': sorted(row['case_id'] for row in deletion_requests),
         'evidence_lookup': evidence_lookup,
         'file_ids': {r['file_id'] for r in evidence_files},
         'activity_ids': {r['activity_id'] for r in system_activity},
@@ -253,7 +257,7 @@ def validate_output_csv(path: str | Path, dataset_root: Path | str = DATASET_ROO
         case_ids = [row['case_id'] for row in _read_csv(dataset_root / 'sample_deletion_requests.csv')]
 
     case_map = {case_id: row for case_id, row in dataset['case_rows'].items()}
-    expected_ids = list(case_ids) if case_ids is not None else dataset['case_ids']
+    expected_ids = list(case_ids) if case_ids is not None else dataset['submission_case_ids']
     if not expected_ids:
         expected_ids = dataset['case_ids']
 

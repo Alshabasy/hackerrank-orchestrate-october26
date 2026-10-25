@@ -26,7 +26,9 @@ DELETION_PATTERNS = (
     'personal-data deletion', 'personal data deleted', 'remove the profile', 'delete the profile',
     'request to delete', 'delete the profile associated', 'erase the profile',
     'eliminar mi cuenta', 'eliminación de mi cuenta', 'eliminacion de mi cuenta',
-    'supresión définitive', 'suppression définitive', 'supprimer mon compte'
+    'supresión définitive', 'suppression définitive', 'supprimer mon compte',
+    'close the account completely', 'account deletion request', 'profile is gone',
+    'アカウントの完全な削除', 'アカウントを削除'
 )
 NON_DELETION_PATTERNS = (
     'access my profile', 'download my account', 'correct my', 'update my profile', 'export my data',
@@ -327,6 +329,8 @@ def _request_email_candidates(case: Any, dataset: Any) -> Tuple[str, ...]:
             candidates.add(normalize_email(identity.email))
     matched_user_ids = {user_id for email, user_id in by_email.items() if email == request_email}
     for entry in getattr(dataset, 'user_audit_log', []):
+        if not eligible_at(entry.event_time, case.audit_at):
+            continue
         if entry.user_id in matched_user_ids:
             if entry.old_value:
                 candidates.add(normalize_email(entry.old_value))
@@ -349,8 +353,13 @@ def _subject_tokens(case: Any, dataset: Any) -> Set[str]:
     for identity in getattr(dataset, 'user_identities', []):
         if normalize_email(identity.email) == request_email:
             matched_user_ids.add(identity.user_id)
+    for identity in getattr(dataset, 'user_identities', []):
+        if normalize_email(identity.email) == request_email:
             tokens.add(normalize_email(identity.email))
             tokens.add(normalize_email(identity.name))
+    for identity in getattr(dataset, 'user_identities', []):
+        if identity.user_id in matched_user_ids:
+            tokens.update((normalize_email(identity.email), normalize_email(identity.name), identity.email_hash.lower(), identity.user_id.lower()))
             digits = normalize_phone(identity.phone)
             if len(digits) >= 7:
                 tokens.add(digits)
@@ -481,7 +490,30 @@ def decide_status(case: Any, dataset: Any, facts: Optional[Any] = None) -> Dict[
 def _ordered_step_phases(steps: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
     ordered = [dict(item) for item in steps]
     phases = {'FINDING': 0, 'REMEDIATION': 1, 'VERIFICATION': 2}
-    ordered.sort(key=lambda item: (phases.get(str(item.get('phase')), 99), int(item.get('step_no', 0))))
+    operation_order = {
+        'REPORT_REMAINING_RECORD': 0,
+        'REPORT_EXPOSED_PII': 1,
+        'REPORT_ACTIVE_DATA_FLOW': 2,
+        'REPORT_RESTORE_RISK': 3,
+        'DISABLE_DATA_FLOW': 0,
+        'BLOCK_RESTORE': 1,
+        'DELETE_RECORD': 2,
+        'REDACT_RECORD': 3,
+        'ANONYMIZE_RECORD': 4,
+        'VERIFY_RECORD_ABSENT': 0,
+        'VERIFY_RECORD_PRESENT': 1,
+        'VERIFY_RECORD_REDACTED': 2,
+        'VERIFY_RECORD_ANONYMIZED': 3,
+        'VERIFY_DATA_FLOW_DISABLED': 4,
+        'VERIFY_RESTORE_BLOCKED': 5,
+    }
+    ordered.sort(key=lambda item: (
+        phases.get(str(item.get('phase')), 99),
+        operation_order.get(str(item.get('operation')), 99),
+        str(item.get('system_id', '')),
+        str(item.get('resource_id', '')),
+        int(item.get('step_no', 0)),
+    ))
     for idx, item in enumerate(ordered, start=1):
         item['step_no'] = idx
     return ordered

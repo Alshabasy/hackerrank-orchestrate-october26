@@ -4,7 +4,7 @@
 
 The submitted prediction pipeline is a local deterministic Python program. Its prediction path makes no model-provider/API calls. The full output contains 518 requests; model-call totals below therefore refer to inference for that run, not AI tools used while developing the repository.
 
-The final run was performed from the repository root on 2026-10-25 with `python3 code/main.py --draft-output /tmp/ghost-output-candidate.csv`. The generated candidate was checked with `python3 code/main.py --validate-output /tmp/ghost-output-candidate.csv` before being copied to root `output.csv`; the committed output was then validated again. The candidate and final file each contain 518 request rows.
+The final run was performed from the repository root on 2026-10-25 with `python3 code/main.py --draft-output /tmp/ghost-output-final.csv`. The generated candidate passed both `python3 code/main.py --validate-output /tmp/ghost-output-final.csv` and `python3 code/validate_output.py /tmp/ghost-output-final.csv`, then was copied to root `output.csv`. The root output was validated again and contains 518 request rows.
 
 | Provider / execution | Model | Calls | Input tokens | Output tokens | Total tokens | Estimated cost |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |

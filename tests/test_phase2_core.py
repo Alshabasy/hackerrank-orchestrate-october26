@@ -1,3 +1,4 @@
+import json
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from code.core import (
     eligible_at,
     infer_email_hash_algorithm,
     resolve_identity,
+    serialize_steps,
     validate_evidence_id,
 )
 from code.loaders import load_all_dataset
@@ -80,6 +82,16 @@ class Phase2CoreTests(unittest.TestCase):
         self.assertTrue(any(step.get('phase') == 'FINDING' and step.get('evidence_id') for step in steps))
         self.assertNotEqual(steps[0]['evidence_id'], 'activity_01')
         self.assertNotEqual(steps[0]['resource_id'], f"account_{case.case_id.split('_')[-1]}")
+
+    def test_serialization_orders_recreation_blockers_before_record_changes(self):
+        steps = [
+            {'step_no': 1, 'phase': 'REMEDIATION', 'system_id': 'account_service', 'resource_id': 'account_1', 'operation': 'DELETE_RECORD', 'state': 'ABSENT', 'evidence_id': ''},
+            {'step_no': 2, 'phase': 'REMEDIATION', 'system_id': 'sync_service', 'resource_id': 'flow_1', 'operation': 'DISABLE_DATA_FLOW', 'state': 'DISABLED', 'evidence_id': ''},
+            {'step_no': 3, 'phase': 'REMEDIATION', 'system_id': 'backup_service', 'resource_id': 'backup_1', 'operation': 'BLOCK_RESTORE', 'state': 'BLOCKED', 'evidence_id': ''},
+        ]
+        actual = json.loads(serialize_steps(steps))
+        self.assertEqual([row['operation'] for row in actual], ['DISABLE_DATA_FLOW', 'BLOCK_RESTORE', 'DELETE_RECORD'])
+        self.assertEqual([row['step_no'] for row in actual], [1, 2, 3])
 
 
 if __name__ == '__main__':

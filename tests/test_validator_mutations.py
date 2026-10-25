@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from code.validate_output import validate_output_csv
+from code.validate_output import load_dataset, validate_output_csv
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET = ROOT / 'dataset'
@@ -21,6 +21,12 @@ def _valid_rows():
 
 
 class ValidatorMutationTests(unittest.TestCase):
+    def test_default_output_case_set_excludes_public_sample_rows(self):
+        dataset = load_dataset(DATASET)
+        self.assertEqual(len(dataset['submission_case_ids']), 518)
+        self.assertNotIn('case_01', dataset['submission_case_ids'])
+        self.assertIn('case_01', dataset['case_rows'])
+
     def _write_valid_file(self, rows):
         tmp = tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8', newline='')
         writer = csv.writer(tmp)
