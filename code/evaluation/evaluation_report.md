@@ -1,49 +1,52 @@
 # Evaluation report
 
-## Summary
+## Scope and method
 
-This submission uses a deterministic local Python solver. It does not call an external model provider, and the final dataset output is generated from the repo’s rule-driven logic and validated against the production case set.
+`python3 code/evaluation/main.py` validates the full root output against the public output contract, then scores the implementation against the 32 participant-facing examples in `dataset/sample_output.csv`. This sample score is not a measurement of accuracy on the 518 hidden evaluation cases. Hidden-answer accuracy cannot be calculated from participant-facing files and is not claimed here.
 
-## Measured validation results
+Field matches compare corresponding steps by array position and all seven required fields. Step accuracy counts a step only when all seven fields match. Sequence accuracy requires the complete status and ordered step array to match for the sample case. These metrics are intentionally reported separately from structural output validation.
 
-The current branch was verified with the project’s regression suite and the dataset-specific output validation path:
+## Measured results
 
-- Regression suite: `python3 -m unittest discover -s tests -q`
-- Result: `Ran 30 tests in 6.925s` and `OK`
-- Output validation: `validate_output_csv('output.csv', Path('dataset'), case_ids)`
-- Result: `validation_errors= 0`
-- Final artifact: [output.csv](../../output.csv)
-- Final row count: 518 rows, one for each request in the evaluation set
+Full evaluation output (`output.csv`):
 
-## Case-level and step-level status
+- Contract validation: **PASS**, 518 of 518 request rows, sorted, required header, valid JSON arrays, and validator checks passed.
+- Status distribution: 351 `INCOMPLETE`, 107 `COMPLETE`, 60 `NOT_APPLICABLE`.
 
-The challenge contract requires one row per case with `case_id,deletion_status,steps_json` and valid sequencing. The current solver produces the required 518-row full-dataset output and passes the project’s production-case validation logic. Because this is a deterministic local solver rather than a model-backed pipeline, the evaluation here is measured in code checks rather than token-based model inference.
+Public sample benchmark (32 cases, 193 expected steps):
 
-## Additional participant-created evaluation cases
+| Metric | Result |
+| --- | ---: |
+| Case-level deletion-status accuracy | 25/32 = **78.1%** |
+| Step-level exact accuracy at expected positions | 0/193 = **0.0%** |
+| Field-level match rate at expected positions | 304/1,351 = **22.5%** |
+| Ordered sequence accuracy (status and all steps exact) | 0/32 = **0.0%** |
 
-These supplemental checks are grounded in the official deletion contract and the repository validator:
+The output is structurally valid, but this sample benchmark shows that semantic and step accuracy are currently inadequate for a confident submission. Passing the structural validator does not establish correctness against hidden answers.
 
-1. `eval_case_01` — non-deletion request for account information export with “do not remove the account” language.
-   - Expected result: `NOT_APPLICABLE`
-   - Reason: the request is an access/export action, not an authorized deletion request.
+## Participant-created supplemental cases
 
-2. `eval_case_02` — request to delete the account and remove the profile, while the evidence still shows a live failover replica before `audit_at`.
-   - Expected result: `INCOMPLETE`
-   - Reason: a remaining record or active replication path prevents a complete deletion decision.
+These three deterministic request-classification checks are implemented in `code/evaluation/main.py` and run as part of the evaluation command:
 
-3. `eval_case_03` — correction request that asks to keep the account active and update contact details.
-   - Expected result: `NOT_APPLICABLE`
-   - Reason: the request is not an authorization to delete personal data.
+1. **Export-only request:** “Please export my account information; do not delete anything.” Expected `NOT_AUTHORIZED`; passed.
+2. **Explicit deletion request:** “Please permanently delete my account and personal data.” Expected `AUTHORIZED`; passed.
+3. **Correction-only request:** “Please correct my phone number and keep the account active.” Expected `NOT_AUTHORIZED`; passed.
+
+These are supplemental classifier checks, not substitutes for end-to-end deletion audit cases.
 
 ## Failures found and improvements made
 
-- Failure found: the decision engine could incorrectly treat a live replica as if the account were already gone when the evidence matched the subject by email alone.
-- Improvement made: subject matching now uses case-specific identity + historical-email + resource evidence tied to the relevant `audit_at` cutoff before treating a record as absent.
-- Failure found: post-audit evidence IDs were not being rejected by the validator in the final pass.
-- Improvement made: the validator now rejects evidence timestamps after the case’s `audit_at` and enforces the phase ordering and empty-evidence rules required by the contract.
-- Failure found: sample-only leakage could contaminate status decisions.
-- Improvement made: the solver avoids user-supplied sample output as an oracle and relies on participant-visible evidence and rules.
+- The public sample run found 7 incorrect statuses out of 32. The previous recorded run had 8; the current solver improves that public metric by one case.
+- No expected sample step matched exactly at its corresponding position across 193 expected steps, and no full sample sequence matched exactly.
+- The step builder still reduces many multi-record, policy-aware investigations to a small set of activity-derived steps. It needs a systematic, record-level evidence index and policy-driven treatment plans to raise step and sequence accuracy.
+- Added deterministic PDF text extraction when `pdftotext` is installed, with a per-process cache; raster images remain unprocessed because no OCR engine is available in the runtime. Added Spanish and French deletion-intent phrases and filtered short digit fragments that can collide with unrelated identifiers.
+- The evaluation runner reports only public-sample results and full-output structural validation. No hidden-set accuracy is claimed.
 
-## Final result
+## Reproduction
 
-The repository’s current deterministic solver is in a verified state for the production dataset. The final root-level output file is present, contains 518 valid rows, and passes the project-confirmed validation check with zero errors.
+From the repository root, run:
+
+```bash
+python3 code/evaluation/main.py
+python3 -m unittest discover -s tests -q
+```

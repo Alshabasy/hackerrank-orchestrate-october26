@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+from functools import lru_cache
 import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,7 +24,9 @@ DELETION_PATTERNS = (
     'have it permanently deleted', 'delete this account', 'account deletion', 'delete account',
     'delete the account', 'erase the account', 'account associated with this email',
     'personal-data deletion', 'personal data deleted', 'remove the profile', 'delete the profile',
-    'request to delete', 'delete the profile associated', 'erase the profile'
+    'request to delete', 'delete the profile associated', 'erase the profile',
+    'eliminar mi cuenta', 'eliminación de mi cuenta', 'eliminacion de mi cuenta',
+    'supresión définitive', 'suppression définitive', 'supprimer mon compte'
 )
 NON_DELETION_PATTERNS = (
     'access my profile', 'download my account', 'correct my', 'update my profile', 'export my data',
@@ -52,6 +56,16 @@ def normalize_email(value: str) -> str:
 def normalize_phone(value: str) -> str:
     digits = re.sub(r'\D', '', value)
     return digits
+
+
+def _contains_subject_token(haystack: str, token: str) -> bool:
+    if not token:
+        return False
+    if token.isdigit():
+        return len(token) >= 7 and re.search(rf'(?<!\d){re.escape(token)}(?!\d)', haystack) is not None
+    if token.startswith('user_'):
+        return re.search(rf'(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])', haystack) is not None
+    return token in haystack
 
 
 def eligible_at(timestamp: datetime, audit_at: datetime) -> bool:
@@ -195,7 +209,8 @@ def evidence_inventory(dataset: Any) -> Dict[str, Any]:
         lower = row.file_path.lower()
         if lower.endswith('.pdf') or '.pdf' in lower:
             by_type['pdf'] += 1
-            unread.append(row.file_id)
+            if not _pdf_text_available():
+                unread.append(row.file_id)
         elif lower.endswith(('.png', '.jpg', '.jpeg', '.gif')):
             by_type['image'] += 1
             unread.append(row.file_id)
@@ -204,6 +219,36 @@ def evidence_inventory(dataset: Any) -> Dict[str, Any]:
         elif lower.endswith(('.log', '.txt', '.json')):
             by_type['log' if lower.endswith('.log') else 'text' if lower.endswith('.txt') else 'json'] += 1
     return {'unread': tuple(unread), 'counts': by_type}
+
+
+def _pdf_text_available() -> bool:
+    """Whether the deterministic PDF text extractor is installed."""
+    try:
+        subprocess.run(['pdftotext', '-v'], capture_output=True, check=False, timeout=3)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@lru_cache(maxsize=256)
+def _read_evidence_text_cached(path_text: str) -> str:
+    """Read text evidence, including text-based PDFs when Poppler is available."""
+    path = Path(path_text)
+    if path.suffix.lower() == '.pdf':
+        result = subprocess.run(
+            ['pdftotext', '-layout', str(path), '-'],
+            capture_output=True, check=False, timeout=20,
+        )
+        if result.returncode != 0:
+            return ''
+        return result.stdout.decode('utf-8', errors='replace')
+    if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif'}:
+        return ''  # Raster evidence requires OCR; never pretend raw bytes are evidence.
+    return path.read_text(encoding='utf-8-sig', errors='replace')
+
+
+def _read_evidence_text(path: Path) -> str:
+    return _read_evidence_text_cached(str(path.resolve()))
 
 
 def build_case_facts(dataset: Any, case_id: str) -> DataFacts:
@@ -307,7 +352,7 @@ def _subject_tokens(case: Any, dataset: Any) -> Set[str]:
             tokens.add(normalize_email(identity.email))
             tokens.add(normalize_email(identity.name))
             digits = normalize_phone(identity.phone)
-            if digits:
+            if len(digits) >= 7:
                 tokens.add(digits)
     for entry in getattr(dataset, 'user_audit_log', []):
         if entry.user_id in matched_user_ids or normalize_email(getattr(entry, 'old_value', '')) == request_email or normalize_email(getattr(entry, 'new_value', '')) == request_email:
@@ -317,7 +362,7 @@ def _subject_tokens(case: Any, dataset: Any) -> Set[str]:
                     if normalized:
                         tokens.add(normalized)
                     digits = normalize_phone(value)
-                    if digits:
+                    if len(digits) >= 7:
                         tokens.add(digits)
     return {token.lower() for token in tokens if token}
 
@@ -330,7 +375,7 @@ def _case_resource_candidates(case: Any, dataset: Any) -> Set[str]:
             continue
         try:
             path = Path('dataset') / file.file_path
-            content = path.read_text(encoding='utf-8-sig', errors='replace')
+            content = _read_evidence_text(path)
         except Exception:
             continue
         if not any(token in content.lower() for token in subject_tokens if token):
@@ -462,7 +507,7 @@ def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Option
     for file in getattr(dataset, 'evidence_files', []):
         if getattr(file, 'captured_at', None) is not None and file.captured_at <= case.audit_at:
             try:
-                content = (Path('dataset') / file.file_path).read_text(encoding='utf-8-sig', errors='replace')
+                content = _read_evidence_text(Path('dataset') / file.file_path)
             except Exception:
                 continue
             if not any(token in content.lower() for token in _subject_tokens(case, dataset)):
