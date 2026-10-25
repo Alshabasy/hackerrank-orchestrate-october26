@@ -37,6 +37,8 @@ Run the starter Python entry point with:
 python3 code/main.py
 ```
 
+The solution uses Python's standard library and reads evidence files under `dataset/evidence/`, including SQL snapshots through SQLite. It extracts text from PDFs when `pdftotext` is installed and uses Tesseract OCR for raster evidence when `tesseract` is installed; without Tesseract, it still reads image files but cannot extract their text.
+
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
 

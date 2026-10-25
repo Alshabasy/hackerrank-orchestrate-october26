@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from code.core import (
+    _latest_case_observations,
+    _observation_state,
     build_steps,
     classify_request,
     decide_status,
@@ -92,6 +94,19 @@ class Phase2CoreTests(unittest.TestCase):
         actual = json.loads(serialize_steps(steps))
         self.assertEqual([row['operation'] for row in actual], ['DISABLE_DATA_FLOW', 'BLOCK_RESTORE', 'DELETE_RECORD'])
         self.assertEqual([row['step_no'] for row in actual], [1, 2, 3])
+
+    def test_sql_snapshot_row_surfaces_subject_restore_risk(self):
+        case = next(row for row in DATASET.sample_deletion_requests if row.case_id == 'case_09')
+        observations = _latest_case_observations(case, DATASET)
+        backup = next(row for row in observations if row['resource_id'] == 'backup_4978')
+        self.assertEqual(backup['category'], 'BACKUP_ARCHIVE')
+        self.assertEqual(_observation_state(backup), 'ACTIVE')
+
+    def test_readback_result_overrides_subject_query_start_line(self):
+        case = next(row for row in DATASET.sample_deletion_requests if row.case_id == 'case_15')
+        observations = _latest_case_observations(case, DATASET)
+        account = next(row for row in observations if row['resource_id'] == 'account_4745')
+        self.assertEqual(_observation_state(account), 'ABSENT')
 
 
 if __name__ == '__main__':

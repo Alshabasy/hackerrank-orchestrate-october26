@@ -5,6 +5,7 @@ from functools import lru_cache
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -17,6 +18,7 @@ from .loaders import load_all_dataset
 from .models import DataFacts, IdentityResult, Observation
 
 UTC = timezone.utc
+_CASE_EVIDENCE_CACHE: Dict[Tuple[int, str, datetime], Tuple[Any, List[Dict[str, Any]]]] = {}
 
 DELETION_PATTERNS = (
     'delete', 'deletion', 'deleted', 'erase', 'erased', 'close my account', 'close this account',
@@ -67,6 +69,10 @@ def _contains_subject_token(haystack: str, token: str) -> bool:
         return len(token) >= 7 and re.search(rf'(?<!\d){re.escape(token)}(?!\d)', haystack) is not None
     if token.startswith('user_'):
         return re.search(rf'(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])', haystack) is not None
+    if '@' in token or re.fullmatch(r'[0-9a-f]{32,}', token):
+        return re.search(rf'(?<![A-Za-z0-9_.+-]){re.escape(token)}(?![A-Za-z0-9_.+-])', haystack) is not None
+    if ' ' in token:
+        return re.search(rf'(?<!\w){re.escape(token)}(?!\w)', haystack, flags=re.UNICODE) is not None
     return token in haystack
 
 
@@ -155,8 +161,9 @@ def resolve_identity(case: Any, identities: Sequence[Any], audit_log: Sequence[A
     email_to_users: Dict[str, List[str]] = {}
     phone_to_users: Dict[str, List[str]] = {}
     for identity in identities:
-        email_to_users.setdefault(normalize_email(identity.email), []).append(identity.user_id)
-        phone_to_users.setdefault(normalize_phone(identity.phone), []).append(identity.user_id)
+        if identity.updated_at <= audit_at:
+            email_to_users.setdefault(normalize_email(identity.email), []).append(identity.user_id)
+            phone_to_users.setdefault(normalize_phone(identity.phone), []).append(identity.user_id)
     for entry in audit_log:
         if entry.field_name == 'email' and eligible_at(entry.event_time, audit_at):
             email_to_users.setdefault(normalize_email(entry.new_value), []).append(entry.user_id)
@@ -178,14 +185,18 @@ def resolve_identity(case: Any, identities: Sequence[Any], audit_log: Sequence[A
 
 
 def _is_sql_safe_for_memory(sql_text: str) -> bool:
-    denied = ('ATTACH', 'DETACH', 'LOAD_EXTENSION', 'PRAGMA', 'CREATE VIRTUAL TABLE', 'CREATE TEMP TABLE')
+    denied = ('ATTACH', 'DETACH', 'LOAD_EXTENSION', 'CREATE VIRTUAL TABLE', 'CREATE TEMP TABLE')
     upper = sql_text.upper()
     for token in denied:
         if token in upper:
             return False
+    pragma_statements = re.findall(r'(?im)^\s*PRAGMA\s+([^;]+);?', sql_text)
+    if any(statement.strip().upper() != 'FOREIGN_KEYS=ON' for statement in pragma_statements):
+        return False
     return True
 
 
+@lru_cache(maxsize=128)
 def load_sql_snapshot(sql_path: Path) -> Dict[str, Any]:
     sql_text = sql_path.read_text(encoding='utf-8-sig', errors='replace')
     if not _is_sql_safe_for_memory(sql_text):
@@ -196,9 +207,12 @@ def load_sql_snapshot(sql_path: Path) -> Dict[str, Any]:
         conn.executescript(sql_text)
         tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
         row_counts = {}
+        table_rows = {}
         for table in tables:
-            row_counts[table] = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-        return {'tables': tables, 'row_counts': row_counts, 'sql': sql_text}
+            rows = conn.execute(f'SELECT * FROM "{table}"').fetchall()
+            row_counts[table] = len(rows)
+            table_rows[table] = [dict(row) for row in rows]
+        return {'tables': tables, 'row_counts': row_counts, 'table_rows': table_rows, 'sql': sql_text}
     finally:
         conn.close()
 
@@ -215,7 +229,8 @@ def evidence_inventory(dataset: Any) -> Dict[str, Any]:
                 unread.append(row.file_id)
         elif lower.endswith(('.png', '.jpg', '.jpeg', '.gif')):
             by_type['image'] += 1
-            unread.append(row.file_id)
+            if not _image_ocr_available():
+                unread.append(row.file_id)
         elif lower.endswith('.sql'):
             by_type['sql'] += 1
         elif lower.endswith(('.log', '.txt', '.json')):
@@ -232,6 +247,10 @@ def _pdf_text_available() -> bool:
         return False
 
 
+def _image_ocr_available() -> bool:
+    return shutil.which('tesseract') is not None
+
+
 @lru_cache(maxsize=256)
 def _read_evidence_text_cached(path_text: str) -> str:
     """Read text evidence, including text-based PDFs when Poppler is available."""
@@ -245,12 +264,28 @@ def _read_evidence_text_cached(path_text: str) -> str:
             return ''
         return result.stdout.decode('utf-8', errors='replace')
     if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif'}:
-        return ''  # Raster evidence requires OCR; never pretend raw bytes are evidence.
+        # Read the local media even when OCR is unavailable. If Tesseract exists,
+        # use its text output as evidence; otherwise fail closed with no extracted text.
+        path.read_bytes()
+        if not _image_ocr_available():
+            return ''
+        result = subprocess.run(
+            ['tesseract', str(path), 'stdout'],
+            capture_output=True, check=False, timeout=30,
+        )
+        if result.returncode != 0:
+            return ''
+        return result.stdout.decode('utf-8', errors='replace')
     return path.read_text(encoding='utf-8-sig', errors='replace')
 
 
 def _read_evidence_text(path: Path) -> str:
     return _read_evidence_text_cached(str(path.resolve()))
+
+
+@lru_cache(maxsize=256)
+def _read_evidence_json(path_text: str) -> Any:
+    return json.loads(_read_evidence_text(Path(path_text)))
 
 
 def build_case_facts(dataset: Any, case_id: str) -> DataFacts:
@@ -323,21 +358,19 @@ VALID_STATES = {
 def _request_email_candidates(case: Any, dataset: Any) -> Tuple[str, ...]:
     request_email = normalize_email(getattr(case, 'email', ''))
     candidates = {request_email}
-    by_email = {normalize_email(row.email): row.user_id for row in getattr(dataset, 'user_identities', [])}
+    resolved = resolve_identity(case, dataset.user_identities, dataset.user_audit_log, case.audit_at)
+    matched_user_ids = {resolved.user_id} if resolved.status == 'RESOLVED' and resolved.user_id else set()
     for identity in getattr(dataset, 'user_identities', []):
-        if normalize_email(identity.email) == request_email:
+        if identity.user_id in matched_user_ids and identity.updated_at <= case.audit_at:
             candidates.add(normalize_email(identity.email))
-    matched_user_ids = {user_id for email, user_id in by_email.items() if email == request_email}
     for entry in getattr(dataset, 'user_audit_log', []):
         if not eligible_at(entry.event_time, case.audit_at):
             continue
         if entry.user_id in matched_user_ids:
-            if entry.old_value:
+            if entry.field_name == 'email' and entry.old_value:
                 candidates.add(normalize_email(entry.old_value))
-            if entry.new_value:
+            if entry.field_name == 'email' and entry.new_value:
                 candidates.add(normalize_email(entry.new_value))
-        if normalize_email(entry.old_value) == request_email or normalize_email(entry.new_value) == request_email:
-            candidates.add(request_email)
     return tuple(sorted(candidate for candidate in candidates if candidate))
 
 
@@ -346,39 +379,49 @@ def _subject_tokens(case: Any, dataset: Any) -> Set[str]:
     request_email = normalize_email(getattr(case, 'email', ''))
     if request_email:
         tokens.add(request_email)
-    matched_user_ids = set()
-    by_email = {normalize_email(row.email): row.user_id for row in getattr(dataset, 'user_identities', [])}
-    if request_email in by_email:
-        matched_user_ids.add(by_email[request_email])
+    resolved = resolve_identity(case, dataset.user_identities, dataset.user_audit_log, case.audit_at)
+    matched_user_ids = {resolved.user_id} if resolved.status == 'RESOLVED' and resolved.user_id else set()
     for identity in getattr(dataset, 'user_identities', []):
-        if normalize_email(identity.email) == request_email:
-            matched_user_ids.add(identity.user_id)
-    for identity in getattr(dataset, 'user_identities', []):
-        if normalize_email(identity.email) == request_email:
+        if identity.user_id in matched_user_ids and identity.updated_at <= case.audit_at:
             tokens.add(normalize_email(identity.email))
             tokens.add(normalize_email(identity.name))
-    for identity in getattr(dataset, 'user_identities', []):
-        if identity.user_id in matched_user_ids:
             tokens.update((normalize_email(identity.email), normalize_email(identity.name), identity.email_hash.lower(), identity.user_id.lower()))
             digits = normalize_phone(identity.phone)
             if len(digits) >= 7:
                 tokens.add(digits)
     for entry in getattr(dataset, 'user_audit_log', []):
-        if entry.user_id in matched_user_ids or normalize_email(getattr(entry, 'old_value', '')) == request_email or normalize_email(getattr(entry, 'new_value', '')) == request_email:
+        if entry.user_id in matched_user_ids and eligible_at(entry.event_time, case.audit_at):
             for value in (entry.old_value, entry.new_value):
                 if value:
-                    normalized = normalize_email(value)
-                    if normalized:
-                        tokens.add(normalized)
-                    digits = normalize_phone(value)
-                    if len(digits) >= 7:
-                        tokens.add(digits)
+                    if entry.field_name == 'email':
+                        tokens.add(normalize_email(value))
+                    elif entry.field_name == 'phone':
+                        digits = normalize_phone(value)
+                        if len(digits) >= 7:
+                            tokens.add(digits)
+                    elif entry.field_name == 'email_hash':
+                        tokens.add(value.strip().lower())
     return {token.lower() for token in tokens if token}
 
 
 def _case_resource_candidates(case: Any, dataset: Any) -> Set[str]:
     subject_tokens = _subject_tokens(case, dataset)
     resource_ids: Set[str] = set()
+
+    def matching_scalar(value: Any) -> bool:
+        if not isinstance(value, (str, int, float)):
+            return False
+        normalized = str(value).lower()
+        return any(_contains_subject_token(normalized, token) for token in subject_tokens if token)
+
+    def add_ids(values: Iterable[Any]) -> None:
+        for value in values:
+            if isinstance(value, str):
+                resource_ids.update(re.findall(
+                    r'(?i)\b(?:account|profile|analytics|search|customer|support|export|backup|flow|data_flow|connector|audit_record|tombstone)_[0-9]+\b',
+                    value,
+                ))
+
     for file in getattr(dataset, 'evidence_files', []):
         if getattr(file, 'captured_at', None) is None or file.captured_at > case.audit_at:
             continue
@@ -387,10 +430,495 @@ def _case_resource_candidates(case: Any, dataset: Any) -> Set[str]:
             content = _read_evidence_text(path)
         except Exception:
             continue
-        if not any(token in content.lower() for token in subject_tokens if token):
-            continue
-        resource_ids |= {match for match in re.findall(r'(?i)(?:account|user|profile|analytics|search|customer)_[A-Za-z0-9]+', content) if match}
+        if file.file_path.lower().endswith('.json'):
+            try:
+                payload = _read_evidence_json(str(path.resolve()))
+            except json.JSONDecodeError:
+                payload = None
+            if payload is not None:
+                stack = [payload]
+                while stack:
+                    node = stack.pop()
+                    if isinstance(node, dict):
+                        if any(matching_scalar(value) for value in node.values()):
+                            add_ids(node.values())
+                        stack.extend(node.values())
+                    elif isinstance(node, list):
+                        stack.extend(node)
+                continue
+
+        lines = content.splitlines()
+        hit_lines = [
+            idx for idx, line in enumerate(lines)
+            if any(_contains_subject_token(line.lower(), token) for token in subject_tokens if token)
+        ]
+        for idx in hit_lines:
+            # Text/PDF/SQL records often wrap one record across adjacent lines. Keep
+            # the evidence window local to the matched identifier instead of treating
+            # every resource in a whole batch export as belonging to the subject.
+            if file.file_path.lower().endswith('.log'):
+                trace_match = re.search(r'\btrace_id=([^\s]+)', lines[idx])
+                paired = [lines[idx]]
+                if trace_match:
+                    trace_id = trace_match.group(1)
+                    paired.extend(
+                        line for pos, line in enumerate(lines)
+                        if pos != idx and re.search(r'\btrace_id=([^\s]+)', line)
+                        and re.search(r'\btrace_id=([^\s]+)', line).group(1) == trace_id
+                    )
+                add_ids(paired)
+                continue
+            radius = 0 if file.file_path.lower().endswith('.sql') else 2
+            add_ids(lines[max(0, idx - radius): min(len(lines), idx + radius + 1)])
     return resource_ids
+
+
+def _case_json_observations(case: Any, dataset: Any) -> List[Dict[str, Any]]:
+    """Extract identity-linked record snapshots without assigning sibling rows to a user."""
+    subject_tokens = _subject_tokens(case, dataset)
+    observations: List[Dict[str, Any]] = []
+    pii_keys = {
+        'name', 'full_name', 'customer_name', 'email', 'customer_email', 'owner_email',
+        'requester_email', 'phone', 'customer_phone', 'owner_phone', 'requester_phone', 'email_hash',
+    }
+    category_rules = (
+        ('deleted_customer_references', 'ACCOUNT_TOMBSTONE'),
+        ('customer_profiles', 'USER_PROFILE'),
+        ('search', 'SEARCH_INDEX_ENTRY'),
+        ('cache', 'CACHE_ENTRY'),
+        ('support_attachments', 'SUPPORT_ATTACHMENT'),
+        ('attachment', 'SUPPORT_ATTACHMENT'),
+        ('support_messages', 'SUPPORT_MESSAGE'),
+        ('support_tickets', 'SUPPORT_MESSAGE'),
+        ('analytics', 'ANALYTICS_PROFILE'),
+        ('telemetry', 'PRODUCT_TELEMETRY'),
+        ('user_exports', 'USER_EXPORT'),
+        ('customer_exports', 'USER_EXPORT'),
+        ('marketing', 'MARKETING_PROFILE'),
+        ('delivery', 'EMAIL_DELIVERY_LOG'),
+        ('security_audit', 'SECURITY_AUDIT_LOG'),
+        ('audit_records', 'SECURITY_AUDIT_LOG'),
+        ('restore_entries', 'BACKUP_ARCHIVE'),
+        ('backup', 'BACKUP_ARCHIVE'),
+        ('tombstone', 'ACCOUNT_TOMBSTONE'),
+    )
+
+    def matches_subject(value: Any) -> bool:
+        if not isinstance(value, (str, int, float)):
+            return False
+        normalized = str(value).lower()
+        return any(_contains_subject_token(normalized, token) for token in subject_tokens if token)
+
+    def flatten_scalars(node: Any) -> List[Tuple[str, Any]]:
+        values: List[Tuple[str, Any]] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        values.append((str(key).lower(), value))
+                    else:
+                        stack.append(value)
+            elif isinstance(current, list):
+                stack.extend(current)
+        return values
+
+    def walk(node: Any, context: Tuple[str, ...], evidence_id: str, origin: str) -> None:
+        if isinstance(node, dict):
+            local_context = context + tuple(
+                str(value).lower() for key, value in node.items()
+                if key.lower() in {'data_store', 'collection', 'system', 'system_id', 'data_category', 'table'}
+                and isinstance(value, str)
+            )
+            resource = node.get('resource_id') or node.get('tombstone_id') or node.get('record_id')
+            scalars = flatten_scalars(node)
+            linked = any(
+                matches_subject(value)
+                for key, value in scalars
+                if key not in {'resource_id', 'tombstone_id', 'record_id', 'file_id'}
+            )
+            if isinstance(resource, str) and linked:
+                timestamps = [
+                    value for key, value in scalars
+                    if key in {'observed_at', 'captured_at', 'event_time', 'updated_at', 'created_at'} and isinstance(value, str)
+                ]
+                time_eligible = True
+                for raw_time in timestamps:
+                    try:
+                        parsed = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    if parsed.astimezone(UTC) > case.audit_at:
+                        time_eligible = False
+                        break
+                if time_eligible:
+                    context_parts = set(local_context)
+                    context_text = ' '.join(local_context).lower()
+                    category = next((cat for keyword, cat in category_rules if keyword in context_text), '')
+                    resource_lower = resource.lower()
+                    if resource_lower.startswith('audit_record_'):
+                        category = 'SECURITY_AUDIT_LOG'
+                    elif resource_lower.startswith('backup_'):
+                        category = 'BACKUP_ARCHIVE'
+                    elif resource_lower.startswith('tombstone_'):
+                        category = 'ACCOUNT_TOMBSTONE'
+                    elif resource_lower.startswith('export_'):
+                        category = 'USER_EXPORT'
+                    elif resource_lower.startswith('support_') and not category:
+                        category = 'SUPPORT_MESSAGE'
+                    # A top-level service name is useful context in resource export JSON.
+                    system_id = next((value for value in local_context if value.endswith('_service') or value.endswith('_platform')), origin)
+                    flat_map: Dict[str, List[Any]] = {}
+                    for key, value in scalars:
+                        flat_map.setdefault(key, []).append(value)
+                    personal_values = [
+                        value for key, value in scalars
+                        if key in pii_keys and value not in (None, '', False)
+                    ]
+                    observations.append({
+                        'evidence_id': evidence_id,
+                        'captured_at': next((f.captured_at for f in getattr(dataset, 'evidence_files', []) if f.file_id == evidence_id), case.audit_at),
+                        'observed_at': next((datetime.fromisoformat(value.replace('Z', '+00:00')) for key, value in scalars if key in {'observed_at', 'event_time'} and isinstance(value, str)), None),
+                        'system_id': system_id,
+                        'resource_id': resource,
+                        'category': category,
+                        'linked_to_subject': linked,
+                        'personal_values': tuple(personal_values),
+                        'scalar_values': flat_map,
+                        'context': local_context,
+                    })
+            for key, value in node.items():
+                child_context = local_context + ((str(key).lower(),) if isinstance(value, (dict, list)) else tuple())
+                walk(value, child_context, evidence_id, origin)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, context, evidence_id, origin)
+
+    for file in getattr(dataset, 'evidence_files', []):
+        if file.captured_at > case.audit_at or not file.file_path.lower().endswith('.json'):
+            continue
+        try:
+            payload = _read_evidence_json(str((Path('dataset') / file.file_path).resolve()))
+        except (OSError, json.JSONDecodeError):
+            continue
+        walk(payload, tuple(), file.file_id, file.origin)
+    return observations
+
+
+def _case_evidence_observations(case: Any, dataset: Any) -> List[Dict[str, Any]]:
+    """Return evidence-backed, subject-linked records at the request's audit cutoff."""
+    cache_key = (id(dataset), case.case_id, case.audit_at)
+    cached = _CASE_EVIDENCE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is dataset:
+        return cached[1]
+    observations = _case_json_observations(case, dataset)
+    subject_tokens = _subject_tokens(case, dataset)
+    pii_keys = {
+        'name', 'full_name', 'display_name', 'customer_name', 'email', 'customer_email', 'owner_email',
+        'requester_email', 'phone', 'customer_phone', 'owner_phone', 'requester_phone', 'email_hash',
+    }
+    user_ids = {identity.user_id.lower() for identity in getattr(dataset, 'user_identities', [])}
+    pii_tokens = {token for token in subject_tokens if token not in user_ids}
+    resource_pattern = re.compile(
+        r'(?i)\b(?:account|profile|analytics|search|customer|support|export|backup|flow|data_flow|connector|audit_record|tombstone)_[0-9]+\b'
+    )
+    for file in getattr(dataset, 'evidence_files', []):
+        if file.captured_at > case.audit_at or file.file_path.lower().endswith(('.json', '.sql')):
+            continue
+        try:
+            content = _read_evidence_text(Path('dataset') / file.file_path)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not content:
+            continue
+        lines = content.splitlines()
+        subject_lines = [
+            idx for idx, line in enumerate(lines)
+            if any(_contains_subject_token(line.lower(), token) for token in subject_tokens if token)
+        ]
+        if not subject_lines:
+            continue
+        resource_positions: Dict[str, List[int]] = {}
+        for idx, line in enumerate(lines):
+            for resource_id in resource_pattern.findall(line):
+                resource_positions.setdefault(resource_id, []).append(idx)
+        for resource_id, positions in resource_positions.items():
+            is_log = file.file_path.lower().endswith('.log')
+            if is_log:
+                paired = []
+                for subject_line in subject_lines:
+                    subject_trace = re.search(r'\btrace_id=([^\s]+)', lines[subject_line])
+                    for position in positions:
+                        resource_trace = re.search(r'\btrace_id=([^\s]+)', lines[position])
+                        if position == subject_line or (
+                            subject_trace and resource_trace and subject_trace.group(1) == resource_trace.group(1)
+                        ):
+                            paired.append((abs(position - subject_line), position, subject_line))
+                # Prefer the last readback line in a trace so rows/status fields
+                # override the earlier query-start line.
+                nearest = max(paired, key=lambda item: item[1]) if paired else None
+                max_distance = len(lines)
+            else:
+                nearest = min(
+                    ((abs(pos - subject_line), pos, subject_line) for pos in positions for subject_line in subject_lines),
+                    default=None,
+                )
+                max_distance = 12 if file.file_path.lower().endswith('.pdf') else 0 if file.file_path.lower().endswith('.sql') else 2
+            if nearest is None or nearest[0] > max_distance:
+                continue
+            _, resource_line, subject_line = nearest
+            radius = 8 if file.file_path.lower().endswith('.pdf') else 0 if is_log or file.file_path.lower().endswith('.sql') else 1
+            lo = max(0, min(resource_line, subject_line) - radius)
+            hi = min(len(lines), max(resource_line, subject_line) + radius + 1)
+            window = '\n'.join(lines[lo:hi])
+            embedded_times = re.findall(r'\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b', window)
+            if any(
+                datetime.fromisoformat(raw.replace('Z', '+00:00')).replace(tzinfo=UTC)
+                > case.audit_at
+                for raw in embedded_times
+            ):
+                continue
+            fields = {
+                key.lower(): value.strip(' \t,;"\'')
+                for key, value in re.findall(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s]+)', window)
+            }
+            context = file.file_path.lower() + ' ' + file.origin.lower() + ' ' + window.lower()
+            if 'legacy_contact_index' in context:
+                category = 'SECONDARY_IDENTIFIER'
+            elif 'attachment' in context:
+                category = 'SUPPORT_ATTACHMENT'
+            elif 'support' in context or resource_id.lower().startswith('support_'):
+                category = 'SUPPORT_MESSAGE'
+            elif resource_id.lower().startswith('account_'):
+                category = 'USER_PROFILE'
+            elif resource_id.lower().startswith('search_'):
+                category = 'SEARCH_INDEX_ENTRY'
+            elif resource_id.lower().startswith('analytics_'):
+                category = 'ANALYTICS_PROFILE'
+            elif resource_id.lower().startswith('backup_'):
+                category = 'BACKUP_ARCHIVE'
+            elif resource_id.lower().startswith(('flow_', 'data_flow_', 'connector_')):
+                category = 'DATA_FLOW'
+            elif resource_id.lower().startswith('export_'):
+                category = 'USER_EXPORT'
+            elif resource_id.lower().startswith('tombstone_'):
+                category = 'ACCOUNT_TOMBSTONE'
+            elif resource_id.lower().startswith('audit_record_'):
+                category = 'SECURITY_AUDIT_LOG'
+            else:
+                category = ''
+            personal_values = tuple(sorted(token for token in pii_tokens if _contains_subject_token(window.lower(), token)))
+            service_match = re.search(r'\bservice=([A-Za-z0-9_]+)', window)
+            system_id = service_match.group(1) if service_match else file.origin
+            observations.append({
+                'evidence_id': file.file_id,
+                'captured_at': file.captured_at,
+                'observed_at': next((datetime.fromisoformat(raw.replace('Z', '+00:00')) for raw in embedded_times), file.captured_at),
+                'system_id': system_id,
+                'resource_id': resource_id,
+                'category': category,
+                'linked_to_subject': True,
+                'personal_values': personal_values,
+                'scalar_values': {key: [value] for key, value in fields.items()},
+                'context': (context,),
+            })
+    for file in getattr(dataset, 'evidence_files', []):
+        if file.captured_at > case.audit_at or not file.file_path.lower().endswith('.sql'):
+            continue
+        try:
+            snapshot = load_sql_snapshot(Path('dataset') / file.file_path)
+        except Exception:
+            continue
+        for table, rows in snapshot.get('table_rows', {}).items():
+            for row in rows:
+                flat: List[Tuple[str, Any]] = []
+                for key, value in row.items():
+                    flat.append((str(key).lower(), value))
+                    if isinstance(value, str):
+                        try:
+                            nested = json.loads(value)
+                        except json.JSONDecodeError:
+                            continue
+                        stack = [nested]
+                        while stack:
+                            node = stack.pop()
+                            if isinstance(node, dict):
+                                for child_key, child_value in node.items():
+                                    if isinstance(child_value, (dict, list)):
+                                        stack.append(child_value)
+                                    else:
+                                        flat.append((str(child_key).lower(), child_value))
+                            elif isinstance(node, list):
+                                stack.extend(node)
+                if not any(
+                    _contains_subject_token(str(value).lower(), token)
+                    for _, value in flat if value is not None
+                    for token in subject_tokens if token
+                ):
+                    continue
+                text_values = [str(value) for _, value in flat if isinstance(value, str)]
+                all_text = ' '.join(text_values).lower()
+                resource_match = re.search(
+                    r'(?i)\b(?:account|profile|analytics|search|customer|support|export|backup|flow|data_flow|connector|audit_record|tombstone)_[0-9]+\b',
+                    all_text,
+                )
+                if not resource_match:
+                    continue
+                resource_id = resource_match.group(0)
+                timestamp = file.captured_at
+                for key, value in flat:
+                    if key in {'observed_at', 'captured_at', 'snapshot_at', 'event_time', 'updated_at', 'created_at'} and isinstance(value, str):
+                        try:
+                            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        except ValueError:
+                            continue
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=UTC)
+                        if parsed.astimezone(UTC) > case.audit_at:
+                            timestamp = None
+                            break
+                        timestamp = parsed.astimezone(UTC)
+                if timestamp is None:
+                    continue
+                names = ' '.join([table.lower(), file.file_path.lower(), all_text])
+                category = next((cat for keyword, cat in (
+                    ('tombstone', 'ACCOUNT_TOMBSTONE'), ('customer_profiles', 'USER_PROFILE'),
+                    ('search', 'SEARCH_INDEX_ENTRY'), ('cache', 'CACHE_ENTRY'),
+                    ('support_attachment', 'SUPPORT_ATTACHMENT'), ('support_conversation', 'SUPPORT_MESSAGE'),
+                    ('analytics', 'ANALYTICS_PROFILE'), ('telemetry', 'PRODUCT_TELEMETRY'),
+                    ('export', 'USER_EXPORT'), ('marketing', 'MARKETING_PROFILE'),
+                    ('delivery', 'EMAIL_DELIVERY_LOG'), ('security_audit', 'SECURITY_AUDIT_LOG'),
+                    ('audit_record', 'SECURITY_AUDIT_LOG'), ('backup', 'BACKUP_ARCHIVE'),
+                ) if keyword in names), '')
+                lower_resource = resource_id.lower()
+                if lower_resource.startswith('tombstone_'):
+                    category = 'ACCOUNT_TOMBSTONE'
+                elif lower_resource.startswith('backup_'):
+                    category = 'BACKUP_ARCHIVE'
+                elif lower_resource.startswith('audit_record_'):
+                    category = 'SECURITY_AUDIT_LOG'
+                pii = tuple(
+                    value for key, value in flat
+                    if key in pii_keys and value not in (None, '', False)
+                    and any(_contains_subject_token(str(value).lower(), token) for token in subject_tokens if token)
+                )
+                scalar_values: Dict[str, List[Any]] = {}
+                for key, value in flat:
+                    scalar_values.setdefault(key, []).append(value)
+                system_id = next((str(value) for key, value in flat if key in {'system_id', 'data_store', 'source_system'} and value), file.origin)
+                observations.append({
+                    'evidence_id': file.file_id,
+                    'captured_at': file.captured_at,
+                    'observed_at': timestamp,
+                    'system_id': system_id,
+                    'resource_id': resource_id,
+                    'category': category,
+                    'linked_to_subject': True,
+                    'personal_values': pii,
+                    'scalar_values': scalar_values,
+                    'context': (table.lower(), file.file_path.lower()),
+                })
+    # Multiple evidence files can describe the same resource at different times;
+    # retain each snapshot so the caller can apply the latest observation per resource.
+    _CASE_EVIDENCE_CACHE[cache_key] = (dataset, observations)
+    return observations
+
+
+def _latest_case_observations(case: Any, dataset: Any) -> List[Dict[str, Any]]:
+    latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for observation in _case_evidence_observations(case, dataset):
+        stamp = observation.get('observed_at') or observation.get('captured_at') or case.audit_at
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        if stamp > case.audit_at:
+            continue
+        key = (str(observation.get('system_id', '')), str(observation.get('resource_id', '')))
+        old = latest.get(key)
+        old_stamp = (old.get('observed_at') or old.get('captured_at') or case.audit_at) if old else None
+        if old is None or stamp >= old_stamp:
+            latest[key] = observation
+    return list(latest.values())
+
+
+def _observation_state(observation: Dict[str, Any]) -> str:
+    values = observation.get('scalar_values', {})
+    flattened = {str(key).lower(): [str(value).lower() for value in (items if isinstance(items, (list, tuple)) else [items]) if value is not None] for key, items in values.items()}
+    text = ' '.join(' '.join(items) for items in flattened.values()) + ' ' + ' '.join(observation.get('context', ()))
+    if flattened.get('enabled') in (['false'], ['0']) or flattened.get('restore_allowed') in (['false'], ['0']):
+        return 'SAFE'
+    if flattened.get('restore_allowed') in (['true'], ['1']) or flattened.get('enabled') in (['true'], ['1']):
+        return 'ACTIVE'
+    if flattened.get('eligible') == ['true'] and flattened.get('deletion_block') == ['false']:
+        return 'ACTIVE'
+    if any(value in {'404', '410'} for key in ('http_status', 'status_code') for value in flattened.get(key, [])):
+        return 'ABSENT'
+    row_counts = [
+        int(value) for key in ('rows', 'total', 'total_hits')
+        for value in flattened.get(key, []) if value.isdigit()
+    ]
+    if row_counts and max(row_counts) == 0:
+        return 'ABSENT'
+    if row_counts and max(row_counts) > 0:
+        return 'PII' if observation.get('personal_values') else 'PRESENT'
+    if any(value in {'miss', 'not_found'} for key in ('result', 'profile') for value in flattened.get(key, [])):
+        return 'ABSENT'
+    if observation.get('personal_values'):
+        return 'PII'
+    null_identifier_fields = ('email', 'phone', 'email_hash', 'customer_reference', 'requester_email')
+    present_nulls = sum(value == 'null' for key in null_identifier_fields for value in flattened.get(key, []))
+    if present_nulls >= 2:
+        return 'ANONYMIZED'
+    if any(value in {'200', '1', 'hit', 'true', 'success'} for key in ('http_status', 'status_code', 'rows', 'total_hits', 'result', 'restore_allowed', 'enabled') for value in flattened.get(key, [])):
+        return 'PRESENT'
+    if 'retention_until' in text or 'retained' in text:
+        return 'PRESENT'
+    return 'PRESENT'
+
+
+def _observation_action(observation: Dict[str, Any], dataset: Any) -> str:
+    category = observation.get('category', '')
+    for rule in getattr(dataset, 'deletion_rules', []):
+        if rule.data_category == category:
+            return rule.required_action
+    return {
+        'DATA_FLOW': 'DISABLE',
+        'USER_PROFILE': 'DELETE',
+        'SECONDARY_IDENTIFIER': 'DELETE',
+        'SEARCH_INDEX_ENTRY': 'DELETE',
+        'CACHE_ENTRY': 'DELETE',
+        'SUPPORT_ATTACHMENT': 'DELETE',
+        'SUPPORT_MESSAGE': 'REDACT',
+        'ANALYTICS_PROFILE': 'ANONYMIZE',
+        'PRODUCT_TELEMETRY': 'ANONYMIZE',
+        'USER_EXPORT': 'DELETE',
+        'MARKETING_PROFILE': 'DELETE',
+        'EMAIL_DELIVERY_LOG': 'REDACT',
+        'SECURITY_AUDIT_LOG': 'RETAIN',
+        'LEGAL_HOLD_RECORD': 'RETAIN',
+        'BACKUP_ARCHIVE': 'RETAIN',
+        'ACCOUNT_TOMBSTONE': 'REDACT',
+    }.get(category, '')
+
+
+def _observation_violation(observation: Dict[str, Any], dataset: Any) -> Optional[Tuple[str, str, str]]:
+    """Return finding/remediation/verification ops when an observed record violates policy."""
+    category = observation.get('category', '')
+    action = _observation_action(observation, dataset)
+    state = _observation_state(observation)
+    if category == 'DATA_FLOW':
+        return ('REPORT_ACTIVE_DATA_FLOW', 'DISABLE_DATA_FLOW', 'VERIFY_DATA_FLOW_DISABLED') if state == 'ACTIVE' else None
+    if category == 'BACKUP_ARCHIVE':
+        return ('REPORT_RESTORE_RISK', 'BLOCK_RESTORE', 'VERIFY_RESTORE_BLOCKED') if state == 'ACTIVE' else None
+    if action == 'DELETE' and state != 'ABSENT':
+        return ('REPORT_REMAINING_RECORD', 'DELETE_RECORD', 'VERIFY_RECORD_ABSENT')
+    if action == 'REDACT' and state == 'PII':
+        return ('REPORT_EXPOSED_PII', 'REDACT_RECORD', 'VERIFY_RECORD_REDACTED')
+    if action == 'ANONYMIZE' and state in {'PII', 'PRESENT'}:
+        return ('REPORT_EXPOSED_PII', 'ANONYMIZE_RECORD', 'VERIFY_RECORD_ANONYMIZED')
+    return None
 
 
 def _case_specific_activity(case: Any, dataset: Any) -> Optional[Any]:
@@ -402,13 +930,13 @@ def _case_specific_activity(case: Any, dataset: Any) -> Optional[Any]:
         if getattr(activity, 'event_time', None) is None or activity.event_time > case.audit_at:
             continue
         haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id, getattr(activity, 'event_type', '')] if part).lower()
-        if any(email in haystack for email in request_emails):
+        if any(_contains_subject_token(haystack, email) for email in request_emails):
             candidates.append(activity)
             continue
         if resource_ids and activity.resource_id in resource_ids:
             candidates.append(activity)
             continue
-        if any(token in haystack for token in subject_tokens):
+        if any(_contains_subject_token(haystack, token) for token in subject_tokens):
             candidates.append(activity)
     if not candidates:
         return None
@@ -443,17 +971,15 @@ def _relevant_case_activity(case: Any, dataset: Any) -> List[Any]:
         if getattr(activity, 'event_time', None) is None or activity.event_time > case.audit_at:
             continue
         haystack = ' '.join(part for part in [activity.details, activity.source_system, activity.target_system, activity.resource_id, getattr(activity, 'event_type', '')] if part).lower()
-        if any(email in haystack for email in request_emails):
+        if any(_contains_subject_token(haystack, email) for email in request_emails):
             relevant.append(activity)
             continue
         if activity.resource_id in resource_ids:
             relevant.append(activity)
             continue
-        if any(token in haystack for token in subject_tokens):
+        if any(_contains_subject_token(haystack, token) for token in subject_tokens):
             relevant.append(activity)
             continue
-        if any(token in haystack for token in [token.lower() for token in {case.case_id, normalize_email(case.email)} if token]):
-            relevant.append(activity)
     return sorted(relevant, key=lambda row: row.event_time)
 
 
@@ -467,17 +993,27 @@ def decide_status(case: Any, dataset: Any, facts: Optional[Any] = None) -> Dict[
         return {'status': 'INCOMPLETE', 'reasons': ('identity resolution unresolved for authorized request',), 'evidence_ids': tuple(sorted(eligible_evidence_ids_for_case(case, dataset)))}
 
     relevant_activity = _relevant_case_activity(case, dataset)
-    residual_records = [activity for activity in relevant_activity if activity.event_type in {'DELETE_RECORD', 'INDEX_RECORD', 'UPDATE_RECORD', 'CREATE_EXPORT', 'CHECK_DATA_FLOW'}]
-    active_flows = [activity for activity in relevant_activity if activity.event_type in {'SYNC_RECORD', 'CHECK_DATA_FLOW'}]
-    restore_risks = [activity for activity in relevant_activity if activity.event_type in {'RESTORE_BACKUP', 'CHECK_RESTORE_ACCESS'}]
+    observations = _latest_case_observations(case, dataset)
+    policy_violations = [observation for observation in observations if _observation_violation(observation, dataset)]
+    active_flows = [observation for observation in observations if observation.get('category') == 'DATA_FLOW' and _observation_state(observation) == 'ACTIVE']
+    restore_risks = [observation for observation in observations if observation.get('category') == 'BACKUP_ARCHIVE' and _observation_state(observation) == 'ACTIVE']
+    # A historical DELETE/UPDATE/INDEX event is an operation claim, not proof that
+    # a copy exists now. Only readback evidence (above) or explicit state checks can
+    # establish a current violation.
+    active_flow_checks = [activity for activity in relevant_activity if activity.event_type == 'CHECK_DATA_FLOW' and any(token in activity.details.lower() for token in ('enabled=true', 'active=true', 'status=active'))]
+    restore_checks = [activity for activity in relevant_activity if activity.event_type == 'CHECK_RESTORE_ACCESS' and any(token in activity.details.lower() for token in ('restore_allowed=true', 'enabled=true', 'status=active'))]
 
-    if residual_records or active_flows or restore_risks:
+    if policy_violations or active_flows or restore_risks or active_flow_checks or restore_checks:
         return {
             'status': 'INCOMPLETE',
             'reasons': (
                 'identity-linked evidence shows remaining records or active recreation paths before audit_at',
             ),
-            'evidence_ids': tuple(sorted({row.activity_id for row in relevant_activity})),
+            'evidence_ids': tuple(sorted(
+                {row.activity_id for row in relevant_activity}
+                | {item['evidence_id'] for item in policy_violations + active_flows + restore_risks}
+                | {row.activity_id for row in active_flow_checks + restore_checks}
+            )),
         }
 
     return {
@@ -533,6 +1069,84 @@ def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Option
     if status == 'NOT_APPLICABLE':
         return []
 
+    observations = _latest_case_observations(case, dataset)
+    if observations:
+        def make_step(observation: Dict[str, Any], phase: str, operation: str, state: str, evidence_id: str) -> Dict[str, Any]:
+            return {
+                'step_no': 0,
+                'phase': phase,
+                'system_id': str(observation.get('system_id') or 'unknown_system'),
+                'resource_id': str(observation.get('resource_id') or 'unknown_resource'),
+                'operation': operation,
+                'state': state,
+                'evidence_id': evidence_id,
+            }
+
+        verification_map = {
+            'ABSENT': ('VERIFY_RECORD_ABSENT', 'ABSENT'),
+            'PRESENT': ('VERIFY_RECORD_PRESENT', 'PRESENT'),
+            'ANONYMIZED': ('VERIFY_RECORD_ANONYMIZED', 'ANONYMIZED'),
+        }
+        if status == 'COMPLETE':
+            checks: List[Dict[str, Any]] = []
+            for observation in observations:
+                category = observation.get('category', '')
+                action = _observation_action(observation, dataset)
+                state = _observation_state(observation)
+                if action == 'DELETE' and state == 'ABSENT':
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_RECORD_ABSENT', 'ABSENT', observation['evidence_id']))
+                elif action == 'RETAIN' and state in {'PRESENT', 'SAFE'}:
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_RECORD_PRESENT', 'PRESENT', observation['evidence_id']))
+                elif action == 'REDACT' and state != 'PII' and state in {'PRESENT', 'ANONYMIZED', 'SAFE'}:
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_RECORD_REDACTED', 'REDACTED', observation['evidence_id']))
+                elif action == 'ANONYMIZE' and state == 'ANONYMIZED':
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_RECORD_ANONYMIZED', 'ANONYMIZED', observation['evidence_id']))
+                elif category == 'DATA_FLOW' and state == 'SAFE':
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_DATA_FLOW_DISABLED', 'DISABLED', observation['evidence_id']))
+                elif category == 'BACKUP_ARCHIVE' and state == 'SAFE':
+                    checks.append(make_step(observation, 'VERIFICATION', 'VERIFY_RESTORE_BLOCKED', 'BLOCKED', observation['evidence_id']))
+            if checks:
+                return _ordered_step_phases(checks)
+
+        findings: List[Dict[str, Any]] = []
+        remediations: List[Dict[str, Any]] = []
+        verifications: List[Dict[str, Any]] = []
+        for observation in observations:
+            issue = _observation_violation(observation, dataset)
+            if issue:
+                finding_op, remediation_op, verification_op = issue
+                finding_state = 'ACTIVE' if finding_op in {'REPORT_ACTIVE_DATA_FLOW', 'REPORT_RESTORE_RISK'} else 'PRESENT'
+                verify_state = {
+                    'VERIFY_RECORD_ABSENT': 'ABSENT',
+                    'VERIFY_RECORD_REDACTED': 'REDACTED',
+                    'VERIFY_RECORD_ANONYMIZED': 'ANONYMIZED',
+                    'VERIFY_DATA_FLOW_DISABLED': 'DISABLED',
+                    'VERIFY_RESTORE_BLOCKED': 'BLOCKED',
+                }[verification_op]
+                remediation_state = {
+                    'DELETE_RECORD': 'ABSENT',
+                    'REDACT_RECORD': 'REDACTED',
+                    'ANONYMIZE_RECORD': 'ANONYMIZED',
+                    'DISABLE_DATA_FLOW': 'DISABLED',
+                    'BLOCK_RESTORE': 'BLOCKED',
+                }[remediation_op]
+                findings.append(make_step(observation, 'FINDING', finding_op, finding_state, observation['evidence_id']))
+                remediations.append(make_step(observation, 'REMEDIATION', remediation_op, remediation_state, ''))
+                verifications.append(make_step(observation, 'VERIFICATION', verification_op, verify_state, ''))
+            else:
+                category = observation.get('category', '')
+                action = _observation_action(observation, dataset)
+                state = _observation_state(observation)
+                check = None
+                if action == 'DELETE' and state == 'ABSENT':
+                    check = ('VERIFY_RECORD_ABSENT', 'ABSENT')
+                elif action == 'RETAIN' and state in {'PRESENT', 'SAFE'}:
+                    check = ('VERIFY_RECORD_PRESENT', 'PRESENT')
+                if check:
+                    verifications.append(make_step(observation, 'VERIFICATION', check[0], check[1], ''))
+        if findings:
+            return _ordered_step_phases(findings + remediations + verifications)
+
     relevant = _relevant_case_activity(case, dataset)
     subject_resources = _case_resource_candidates(case, dataset)
     matched_evidence = []
@@ -542,7 +1156,7 @@ def build_steps(case: Any, decision: Dict[str, Any], dataset: Any, facts: Option
                 content = _read_evidence_text(Path('dataset') / file.file_path)
             except Exception:
                 continue
-            if not any(token in content.lower() for token in _subject_tokens(case, dataset)):
+            if not any(_contains_subject_token(content.lower(), token) for token in _subject_tokens(case, dataset)):
                 continue
             matched_evidence.append(file.file_id)
 

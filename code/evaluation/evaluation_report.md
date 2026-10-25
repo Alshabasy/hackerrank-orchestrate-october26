@@ -11,18 +11,18 @@ Field matches compare corresponding steps by array position and all seven requir
 Full evaluation output (`output.csv`):
 
 - Contract validation: **PASS**, 518 of 518 request rows, sorted, required header, valid JSON arrays, and validator checks passed.
-- Status distribution: 445 `INCOMPLETE`, 25 `COMPLETE`, 48 `NOT_APPLICABLE`.
+- Status distribution: 210 `COMPLETE`, 260 `INCOMPLETE`, 48 `NOT_APPLICABLE`.
 
 Public sample benchmark (32 cases, 193 expected steps):
 
 | Metric | Result |
 | --- | ---: |
-| Case-level deletion-status accuracy | 23/32 = **71.9%** |
-| Step-level exact accuracy at expected positions | 0/193 = **0.0%** |
-| Field-level match rate at expected positions | 389/1,351 = **28.8%** |
-| Ordered sequence accuracy (status and all steps exact) | 0/32 = **0.0%** |
+| Case-level deletion-status accuracy | 32/32 = **100.0%** |
+| Step-level exact accuracy at expected positions | 50/193 = **25.9%** |
+| Field-level match rate at expected positions | 698/1,351 = **51.7%** |
+| Ordered sequence accuracy (status and all steps exact) | 1/32 = **3.1%** |
 
-The output is structurally valid, but this sample benchmark shows that semantic and step accuracy are currently inadequate for a confident submission. Passing the structural validator does not establish correctness against hidden answers. Status accuracy decreased compared with the prior recorded run; field matching increased, while full-step and sequence accuracy remain zero.
+The output is structurally valid and all 32 public sample statuses match. Step quality is still materially weaker: only 50 expected steps match all fields at their corresponding positions, and only one full sample sequence matches. Passing the structural validator and public sample status benchmark does not establish correctness against hidden answers.
 
 ## Participant-created supplemental cases
 
@@ -36,12 +36,11 @@ These are supplemental classifier checks, not substitutes for end-to-end deletio
 
 ## Failures found and improvements made
 
-- The current public sample run found 9 incorrect statuses out of 32, compared with 7 in the prior recorded run. The current implementation should not be represented as fully semantically correct.
-- No expected sample step matched exactly at its corresponding position across 193 expected steps, and no full sample sequence matched exactly.
-- Corrected standalone validator defaults so the 518 submission requests are checked independently of the 32 public sample cases, while retaining sample rows for evaluation.
-- Changed serialized remediation ordering to put data-flow and restore blockers before record changes, as required by the contract. Added regression tests for blocker ordering and submission row selection.
-- The step builder still reduces many multi-record, policy-aware investigations to a small set of activity-derived steps. It needs a systematic, record-level evidence index and policy-driven treatment plans to raise step and sequence accuracy.
-- Added deterministic PDF text extraction when `pdftotext` is installed, with a per-process cache; raster images remain unprocessed because no OCR engine is available in the runtime. Added Spanish and French deletion-intent phrases and filtered short digit fragments that can collide with unrelated identifiers.
+- The final public sample run matched all 32 statuses, improved from 23/32 in the previous run.
+- Record-level evidence extraction now handles JSON and executable SQLite snapshots, pairs log readback events by trace ID, filters future evidence, applies exact identifier/name boundaries, and distinguishes a record count from a query-result claim.
+- SQL snapshot extraction ignores neighboring rows and maps policy categories before deriving a treatment. Text-based PDF extraction remains available when `pdftotext` is installed; raster images still require OCR.
+- Validator fixes keep the 518 evaluation requests separate from public calibration rows and enforce recreation blockers before record changes. Regression coverage includes SQL restore risk, latest readback state, ordering, and dataset row selection.
+- Step-level exact accuracy is 25.9%, field-level accuracy is 51.7%, and full sequence accuracy is 3.1%. Some evidence bundles do not expose a direct subject-to-resource link for every verification step; more record-level linkage and policy handling are needed.
 - The evaluation runner reports only public-sample results and full-output structural validation. No hidden-set accuracy is claimed.
 
 ## Reproduction
@@ -51,10 +50,5 @@ From the repository root, run:
 ```bash
 python3 code/evaluation/main.py
 python3 -m unittest discover -s tests -q
-```
-
-The validator also accepts the generated output directly:
-
-```bash
 python3 code/validate_output.py output.csv
 ```

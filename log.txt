@@ -1706,3 +1706,45 @@ branch=main
 repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
 worktree=main
 parent_agent=none
+
+## [2026-10-25T05:10:08Z] Clarify submission compliance
+
+User Prompt (verbatim, secrets redacted):
+okay is the file met all requirements now ?
+
+Agent Response Summary:
+Clarified the difference between mechanical submission compliance and semantic prediction accuracy. The latest output passed structural validation, but its public-sample status, step, and sequence scores show that it does not meet answer-correctness expectations.
+
+Actions:
+* Reviewed the latest validation and evaluation results from this session.
+
+Context:
+tool=Codex desktop
+model=GPT-6
+branch=main
+repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none
+
+## [2026-10-25T05:46:34Z] Improve evidence reconstruction and resubmit artifacts
+
+User Prompt (verbatim, secrets redacted):
+okay, do it
+
+Agent Response Summary:
+Improved evidence matching to use time-bounded current and historical identifiers, avoid sibling-row resource contamination, pair log readback events by trace ID, and inspect JSON and SQLite rows with policy-aware treatment. Added optional Tesseract OCR support and documented that image text extraction requires Tesseract. Regenerated all 518 predictions; both validators pass, all 34 tests pass, and public sample status accuracy is 32/32, with 50/193 exact steps and one exact sequence. Updated reports and rebuilt code.zip without dataset files or caches.
+
+Actions:
+* Updated code/core.py and tests/test_phase2_core.py.
+* Regenerated output.csv from all 518 deletion requests and validated with both validators.
+* Updated README.md and evaluation/usage reports.
+* Rebuilt and inspected code.zip for required contents and excluded dataset/caches/nested archives.
+* Ran 34 unit tests and the public sample evaluation.
+
+Context:
+tool=Codex desktop
+model=GPT-6
+branch=main
+repo_root=/home/amr/Music/Projects/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none
